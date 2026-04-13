@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <mutex>
 
 
 #include <fmt/core.h>
@@ -32,6 +33,10 @@
 #include "ygopro-core/card_data.h"
 #include "ygopro-core/duel.h"
 #include "ygopro-core/ocgapi.h"
+#include "ygopro-core/card.h"
+#include "ygopro-core/field.h"
+
+#include "ygoenv/ygopro/card_embedding_store.h"
 
 // clang-format on
 
@@ -848,6 +853,104 @@ enum class ActionPhase {
   End,
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// Event recording — mirrors ExodAI's state_encoder.EVENT_TYPES exactly.
+// See ADAPTER_EVENTS_DESIGN.md for the design rationale.
+//
+// Events are pushed from handle_message() branches into a per-env ring buffer
+// and serialized to obs:events_ in WriteState. The ring buffer's semantics
+// are "most recent N events as of this decision point", matching what
+// StateEncoder.RecentEvents consumes.
+// ════════════════════════════════════════════════════════════════════════════
+
+enum class EventType : uint8_t {
+  TurnChange = 0,
+  PhaseChange = 1,
+  Draw = 2,
+  CardMoved = 3,
+  Chain = 4,
+  Activate = 5,
+  Summon = 6,
+  Set = 7,
+  Attack = 8,
+};
+
+// Event location IDs — match ExodAI state_encoder.EVENT_LOCATIONS (20 entries).
+// Zones 1..8 are game zones; phases 10..19 are used in the "to" field of
+// phase_change events. 0 = "none", 9 = "unknown".
+constexpr uint8_t EVENT_LOC_NONE      = 0;
+constexpr uint8_t EVENT_LOC_DECK      = 1;
+constexpr uint8_t EVENT_LOC_HAND      = 2;
+constexpr uint8_t EVENT_LOC_MONSTER   = 3;
+constexpr uint8_t EVENT_LOC_SPELL     = 4;
+constexpr uint8_t EVENT_LOC_GRAVE     = 5;
+constexpr uint8_t EVENT_LOC_BANISHED  = 6;
+constexpr uint8_t EVENT_LOC_EXTRA     = 7;
+constexpr uint8_t EVENT_LOC_OVERLAY   = 8;
+constexpr uint8_t EVENT_LOC_UNKNOWN   = 9;
+constexpr uint8_t EVENT_LOC_PH_DRAW        = 10;
+constexpr uint8_t EVENT_LOC_PH_STANDBY     = 11;
+constexpr uint8_t EVENT_LOC_PH_MAIN1       = 12;
+constexpr uint8_t EVENT_LOC_PH_BATTLE_START= 13;
+constexpr uint8_t EVENT_LOC_PH_BATTLE_STEP = 14;
+constexpr uint8_t EVENT_LOC_PH_DAMAGE      = 15;
+constexpr uint8_t EVENT_LOC_PH_DAMAGE_CAL  = 16;
+constexpr uint8_t EVENT_LOC_PH_BATTLE      = 17;
+constexpr uint8_t EVENT_LOC_PH_MAIN2       = 18;
+constexpr uint8_t EVENT_LOC_PH_END         = 19;
+
+// Map an engine LOCATION_* bitmask to the EVENT_LOC_* zone id. Overlay
+// bit is stripped before translation.
+inline uint8_t ygo_location_to_event_loc(uint32_t location) {
+  uint32_t loc = location & 0x7f;
+  bool overlay = (location & LOCATION_OVERLAY) != 0;
+  if (overlay) return EVENT_LOC_OVERLAY;
+  switch (loc) {
+    case LOCATION_DECK:    return EVENT_LOC_DECK;
+    case LOCATION_HAND:    return EVENT_LOC_HAND;
+    case LOCATION_MZONE:   return EVENT_LOC_MONSTER;
+    case LOCATION_SZONE:   return EVENT_LOC_SPELL;
+    case LOCATION_GRAVE:   return EVENT_LOC_GRAVE;
+    case LOCATION_REMOVED: return EVENT_LOC_BANISHED;
+    case LOCATION_EXTRA:   return EVENT_LOC_EXTRA;
+    default:               return EVENT_LOC_UNKNOWN;
+  }
+}
+
+// Map an engine PHASE_* constant to the EVENT_LOC_PH_* id.
+inline uint8_t ygo_phase_to_event_loc(uint32_t phase) {
+  switch (phase) {
+    case PHASE_DRAW:         return EVENT_LOC_PH_DRAW;
+    case PHASE_STANDBY:      return EVENT_LOC_PH_STANDBY;
+    case PHASE_MAIN1:        return EVENT_LOC_PH_MAIN1;
+    case PHASE_BATTLE_START: return EVENT_LOC_PH_BATTLE_START;
+    case PHASE_BATTLE_STEP:  return EVENT_LOC_PH_BATTLE_STEP;
+    case PHASE_DAMAGE:       return EVENT_LOC_PH_DAMAGE;
+    case PHASE_DAMAGE_CAL:   return EVENT_LOC_PH_DAMAGE_CAL;
+    case PHASE_BATTLE:       return EVENT_LOC_PH_BATTLE;
+    case PHASE_MAIN2:        return EVENT_LOC_PH_MAIN2;
+    case PHASE_END:          return EVENT_LOC_PH_END;
+    default:                 return EVENT_LOC_NONE;
+  }
+}
+
+// Ring buffer entry. Holds absolute player seat at push time —
+// WriteState relativizes to the current to_play_ and applies
+// info-hiding. Stores the raw CardCode (konami code) so the encoded
+// events path can look up embeddings directly; the raw obs:events_
+// writer converts to cid when serializing.
+struct EventRecord {
+  uint8_t type;
+  uint32_t code;         // raw konami CardCode; 0 = unknown
+  uint8_t abs_player;    // 0 or 1, absolute seat
+  uint8_t from_loc;
+  uint8_t to_loc;
+  uint8_t reason;        // MSG_MOVE reason bitmask clipped to 8 bits; 0 otherwise
+  uint8_t valid;
+};
+
+constexpr int kMaxEventsInRing = 64;
+
 inline std::string action_phase_to_string(ActionPhase phase) {
   switch (phase) {
   case ActionPhase::None:
@@ -1268,6 +1371,9 @@ struct card_script {
 
 static ankerl::unordered_dense::map<CardCode, Card> cards_;
 static ankerl::unordered_dense::map<CardCode, CardId> card_ids_;
+// Reverse map: cid (1-based code_list line number) → CardCode (konami).
+// Built once at the end of init_module from card_ids_.
+static std::vector<CardCode> cid_to_code_;
 static ankerl::unordered_dense::map<CardCode, card_data> cards_data_;
 static ankerl::unordered_dense::map<std::string, card_script> cards_script_;
 static ankerl::unordered_dense::map<std::string, std::vector<CardCode>>
@@ -1291,6 +1397,14 @@ inline CardId &c_get_card_id(CardCode code) {
     return it->second;
   }
   throw std::runtime_error("[c_get_card_id] Card not found: " + std::to_string(code));
+}
+
+// Load the C++-side card embedding + annotation store from a pre-baked
+// binary file (see ExodAI_ml/bake_c_encoder_data.py). Called once at
+// training setup; used by _set_obs_state to emit the encoded state
+// tensor. Idempotent.
+inline void init_embeddings_store(const std::string &path) {
+  exodai::CardEmbeddingStore::load(path);
 }
 
 inline void sort_extra_deck(std::vector<CardCode> &deck) {
@@ -1427,6 +1541,20 @@ static void init_module(const std::string &db_path,
       std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
           .count();
   // fmt::println("load {} cards in {}ms", cards_data_.size(), milliseconds);
+
+  // Build the reverse map cid → CardCode for _cid_to_code lookups.
+  // card_ids_ maps CardCode → cid (1-based). The reverse vector is
+  // indexed by cid; cid_to_code_[0] is unused (cid is 1-based).
+  {
+    CardId max_cid = 0;
+    for (const auto& [code, cid] : card_ids_) {
+      if (cid > max_cid) max_cid = cid;
+    }
+    cid_to_code_.assign(max_cid + 1, 0);
+    for (const auto& [code, cid] : card_ids_) {
+      cid_to_code_[cid] = code;
+    }
+  }
 
   for (const auto &[name, deck] : decks) {
     auto [main_deck, extra_deck, side_deck] = read_decks(deck);
@@ -1587,20 +1715,77 @@ public:
   template <typename Config>
   static decltype(auto) StateSpec(const Config &conf) {
     int n_action_feats = 12;
+    // ── obs:cards_ schema (43 columns) ──────────────────────────────────
+    //   0..1   cid (hi, lo)         — 16-bit code_list line number
+    //   2      location_id          — location2id
+    //   3      sequence             — slot index +1 (MZONE/SZONE/GRAVE)
+    //   4      controller_relative  — 0 = mine (to_play's view), 1 = opp
+    //   5      position_id          — position2id
+    //   6      overlay              — XYZ material flag
+    //   7      attribute_id
+    //   8      race_id
+    //   9      level
+    //   10     counter (clamped 15)
+    //   11     disabled / forbidden
+    //   12..13 atk (hi, lo)
+    //   14..15 def (hi, lo)
+    //   16..40 type multi-hot (25 type bits)
+    //   41     owner_relative       — 0 = mine, 1 = opp; differs from col 4
+    //                                  iff card has been stolen (Change of
+    //                                  Heart, Snatch Steal). Sourced via
+    //                                  engine pointer access.
+    //   42     attacked_count       — # attacks this turn (engine card field).
+    //                                  Sourced via engine pointer access.
     return MakeDict(
-        "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 41})),
+        "obs:cards_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 43})),
         "obs:global_"_.Bind(Spec<uint8_t>({23})),
         "obs:actions_"_.Bind(
             Spec<uint8_t>({conf["max_options"_], n_action_feats})),
         "obs:h_actions_"_.Bind(
             Spec<uint8_t>({conf["n_history_actions"_], n_action_feats + 2})),
         "obs:mask_"_.Bind(Spec<uint8_t>({conf["max_cards"_] * 2, 14})),
+        // obs:events_ — rolling window of engine-emitted game events,
+        // chronological oldest-to-newest. See ADAPTER_EVENTS_DESIGN.md.
+        //   col 0: event_type_id (EventType enum: 0=turn_change...8=attack)
+        //   col 1: cid_hi
+        //   col 2: cid_lo
+        //   col 3: player relative to to_play (0=mine, 1=opp)
+        //   col 4: from_location_id (EVENT_LOC_* zones + phase ids)
+        //   col 5: to_location_id
+        //   col 6: reason (MSG_MOVE reason bitmask clipped to 8 bits)
+        //   col 7: valid (1 = real event, 0 = padding)
+        "obs:events_"_.Bind(Spec<uint8_t>({64, 8})),
+        // obs:state_ — fully-encoded state vector produced by the C++
+        // state encoder (see ADAPTER_CPP_STATE_ENCODER_DESIGN.md).
+        // Shape matches state_encoder.py::StateEncoder.state_dim = 10655.
+        // Byte-exact parity with the Python encoder, verified via
+        // test_cpp_state_encoder_parity.py before training uses it.
+        "obs:state_"_.Bind(Spec<float>({10655})),
+        // obs:events_encoded_ — per-event encoding of the ring buffer,
+        // mirrors StateEncoder._encode_events. Each row is the 306-dim
+        // event_type_onehot + card_embedding + from_loc_onehot +
+        // to_loc_onehot + player tuple.
+        "obs:events_encoded_"_.Bind(Spec<float>({64, 306})),
+        "obs:event_mask_encoded_"_.Bind(Spec<float>({64})),
+        // obs:actions_encoded_ — per-action encoding matching the Python
+        // adapter's _encode_actions_direct output. (40, 745) float32.
+        // Layout per row: emb(256) + ann(465) + action_type_onehot(13)
+        //                 + location_onehot(7) + extra(4) = 745.
+        // Only the first n_options rows are populated; rest are zeros.
+        "obs:actions_encoded_"_.Bind(Spec<float>({40, 745})),
+        "obs:action_mask_encoded_"_.Bind(Spec<float>({40})),
         "info:num_options"_.Bind(Spec<int>({}, {0, conf["max_options"_] - 1})),
         "info:to_play"_.Bind(Spec<int>({}, {0, 1})),
         "info:is_selfplay"_.Bind(Spec<int>({}, {0, 1})),
         "info:win_reason"_.Bind(Spec<int>({}, {-1, 1})),
         "info:step_time"_.Bind(Spec<double>({2})),
-        "info:deck"_.Bind(Spec<int>({2}))
+        "info:deck"_.Bind(Spec<int>({2})),
+        // info:chain_cids — engine ground truth for the chain stack.
+        // Each entry is the card_id (1-based code_list line number) at
+        // that chain link. 0 means empty slot. Always populated; cheap.
+        "info:chain_cids"_.Bind(Spec<int>({8})),
+        // info:n_events — count of valid rows in obs:events_.
+        "info:n_events"_.Bind(Spec<int>({}, {0, 64}))
       );
   }
   template <typename Config>
@@ -1725,6 +1910,13 @@ protected:
   int ha_p_1_ = 0;
   int ha_p_2_ = 0;
 
+  // Events ring buffer (see ADAPTER_EVENTS_DESIGN.md). Chronological on
+  // emission: oldest at events_ring_[(events_head_ - events_count_) % N],
+  // newest at events_ring_[(events_head_ - 1) % N].
+  std::array<EventRecord, kMaxEventsInRing> events_ring_{};
+  int events_head_ = 0;
+  int events_count_ = 0;
+
   std::unordered_set<std::string> revealed_;
 
   // multi select
@@ -1740,6 +1932,13 @@ protected:
 
   // discard hand cards
   bool discard_hand_ = false;
+
+  // Cached Card vectors from the last _set_obs_cards call. Shared with
+  // _set_obs_state so both encode the same engine snapshot without
+  // re-querying (which can race with position updates).
+  // Layout: cached_cards_[player][location_index] where location_index
+  // is: 0=DECK, 1=HAND, 2=MZONE, 3=SZONE, 4=GRAVE, 5=REMOVED, 6=EXTRA.
+  std::array<std::array<std::vector<Card>, 7>, 2> cached_cards_;
 
   // replay
   bool record_ = false;
@@ -1859,6 +2058,10 @@ public:
     history_actions_2_.Zero();
     ha_p_1_ = 0;
     ha_p_2_ = 0;
+
+    events_ring_.fill({});
+    events_head_ = 0;
+    events_count_ = 0;
 
     // clock_t _start = clock();
 
@@ -2171,6 +2374,28 @@ public:
     history_actions[ha_p](13) = static_cast<uint8_t>(phase_to_id(current_phase_));
   }
 
+  // Push one event into the ring buffer. Stores the raw CardCode and
+  // the absolute player seat; WriteState relativizes to current
+  // to_play_, applies info-hiding for opponent draws, and translates
+  // to cid for the raw obs:events_ stream.
+  void push_event(EventType type, CardCode code, uint8_t abs_player,
+                  uint8_t from_loc, uint8_t to_loc, uint8_t reason = 0) {
+    const CardCode clean_code = code & 0x7fffffff;
+    events_ring_[events_head_] = EventRecord{
+      static_cast<uint8_t>(type),
+      clean_code,
+      abs_player,
+      from_loc,
+      to_loc,
+      reason,
+      1,
+    };
+    events_head_ = (events_head_ + 1) % kMaxEventsInRing;
+    if (events_count_ < kMaxEventsInRing) {
+      ++events_count_;
+    }
+  }
+
   void show_deck(const std::vector<CardCode> &deck, const std::string &prefix) const {
     fmt::print("{} deck: [", prefix);
     for (int i = 0; i < deck.size(); i++) {
@@ -2337,6 +2562,71 @@ public:
     state["info:to_play"_] = int(to_play_);
     state["info:is_selfplay"_] = int(play_mode_ == kSelfPlay);
     state["info:win_reason"_] = win_reason;
+
+    // ── Engine ground truth for the chain stack (debug-mode assertions) ──
+    // Walks game_field->current_chain and writes the cid (1-based code_list
+    // line number) of each chain link's triggering card. Always populated.
+    // The Python adapter uses this to validate its delta-based chain
+    // reconstruction in debug mode.
+    {
+      const int max_chain = 8;
+      const auto &cur = ((duel *)pduel_)->game_field->core.current_chain;
+      const int n_chain = std::min<int>(cur.size(), max_chain);
+      for (int i = 0; i < max_chain; ++i) {
+        if (i < n_chain) {
+          uint32_t code = cur[i].triggering_state.code;
+          // c_get_card_id returns the 1-based line number; 0 if unknown.
+          auto it = card_ids_.find(code);
+          state["info:chain_cids"_][i] =
+              (it != card_ids_.end()) ? it->second : 0;
+        } else {
+          state["info:chain_cids"_][i] = 0;
+        }
+      }
+    }
+
+    // ── Serialize the events ring buffer ──────────────────────────────
+    // Walk chronologically (oldest-first) and emit to obs:events_, applying
+    // player relativization and info-hiding for opponent draws. See
+    // ADAPTER_EVENTS_DESIGN.md for the semantics.
+    {
+      // Zero first — padding rows must be all zeros.
+      for (int i = 0; i < kMaxEventsInRing; ++i) {
+        for (int j = 0; j < 8; ++j) {
+          state["obs:events_"_](i, j) = uint8_t(0);
+        }
+      }
+      int start = (events_head_ - events_count_ + kMaxEventsInRing) % kMaxEventsInRing;
+      for (int i = 0; i < events_count_; ++i) {
+        const auto &e = events_ring_[(start + i) % kMaxEventsInRing];
+        uint8_t player_rel = (e.abs_player != to_play_) ? 1 : 0;
+        // Translate raw code → cid (1-based code_list index) at emit time.
+        // Info-hiding: for Draw events not belonging to the current
+        // to_play, zero the cid so the observer never sees the
+        // opponent's draws.
+        uint16_t cid = 0;
+        if (e.code != 0) {
+          if (e.type == static_cast<uint8_t>(EventType::Draw) &&
+              e.abs_player != to_play_) {
+            cid = 0;
+          } else {
+            auto it = card_ids_.find(e.code);
+            if (it != card_ids_.end()) {
+              cid = static_cast<uint16_t>(it->second);
+            }
+          }
+        }
+        state["obs:events_"_](i, 0) = e.type;
+        state["obs:events_"_](i, 1) = static_cast<uint8_t>(cid >> 8);
+        state["obs:events_"_](i, 2) = static_cast<uint8_t>(cid & 0xff);
+        state["obs:events_"_](i, 3) = player_rel;
+        state["obs:events_"_](i, 4) = e.from_loc;
+        state["obs:events_"_](i, 5) = e.to_loc;
+        state["obs:events_"_](i, 6) = e.reason;
+        state["obs:events_"_](i, 7) = e.valid;
+      }
+      state["info:n_events"_] = events_count_;
+    }
     if (reward != 0.0) {
       state["info:step_time"_][0] = 0;
       state["info:step_time"_][1] = 0;
@@ -2368,6 +2658,27 @@ public:
     }
 
     _set_obs_global(state["obs:global_"_], to_play_, loc_n_cards);
+
+    // ── State encoder: pure transformation of already-written obs data.
+    // Reads from obs:cards_ (just written above) + obs:global_ +
+    // info:chain_cids. Does NOT re-query the engine — eliminates the
+    // position query-race bug observed when using get_cards_in_location.
+    // Wrapped in try/catch so errors surface as log messages instead of
+    // segfaults — the parity test may miss edge cases the training run
+    // exercises.
+    try {
+      const int decision_type = _decision_type_from_msg(msg_);
+      _set_obs_state(state["obs:state_"_], state["obs:cards_"_],
+                     state["obs:global_"_], state["info:chain_cids"_],
+                     decision_type);
+      _set_obs_events_encoded(state["obs:events_encoded_"_],
+                              state["obs:event_mask_encoded_"_]);
+      // Action encoder is called BELOW, after obs:actions_ is written.
+    } catch (const std::exception& e) {
+      fmt::println("[_set_obs_state CRASH] {}", e.what());
+      // Leave obs:state_ as zeros — model will see a degenerate state
+      // but won't crash. The error message tells us what to fix.
+    }
 
     // we can't shuffle because idx must be stable in callback
     if (n_options > max_options()) {
@@ -2412,6 +2723,580 @@ public:
       // state["obs:h_actions_"_](i, 12) = static_cast<uint8_t>(uint8_t(state["obs:h_actions_"_](i, 12)) == to_play_);
       int turn_diff = std::min(16, turn_count_ - uint8_t(state["obs:h_actions_"_](i, 12)));
       state["obs:h_actions_"_](i, 12) = static_cast<uint8_t>(turn_diff);
+    }
+
+    // State encoder and events encoder were already called above,
+    // right after _set_obs_cards, to avoid engine position query races.
+
+    // Action encoder runs HERE, after obs:actions_ has been written by
+    // _set_obs_actions. n_options at this point has been truncated to
+    // max_options if it exceeded.
+    try {
+      _set_obs_actions_encoded(state["obs:actions_encoded_"_],
+                               state["obs:action_mask_encoded_"_],
+                               state["obs:actions_"_],
+                               state["obs:cards_"_],
+                               n_options);
+    } catch (const std::exception& e) {
+      fmt::println("[_set_obs_actions_encoded CRASH] {}", e.what());
+    }
+  }
+
+  // StateEncoder::DECISION_TYPES (state_encoder.py) 0..7 order:
+  //   0 SelectIdleCmd, 1 SelectBattleCmd, 2 SelectCard, 3 SelectYesNo,
+  //   4 SelectEffectYn, 5 SelectChain, 6 SelectPosition, 7 SelectOption.
+  // C# JSON only sends the first 7; the Python encoder falls back to 0
+  // for SelectOption. We preserve that quirk to match parity.
+  inline int _decision_type_from_msg(int msg) const {
+    switch (msg) {
+      case MSG_SELECT_IDLECMD:
+      case MSG_SELECT_TRIBUTE:
+      case MSG_SELECT_SUM:
+      case MSG_SELECT_UNSELECT_CARD:
+        // TRIBUTE/SUM/UNSELECT are all card-selection prompts the Python
+        // encoder maps to decision_type=2 (SelectCard) — but the
+        // _get_decision_type path in Python reads the GameState one-hot
+        // which only encodes the top-level message. For IDLECMD we map
+        // to 0, for card-selection subtypes we map to 2.
+        if (msg == MSG_SELECT_IDLECMD) return 0;
+        return 2;
+      case MSG_SELECT_BATTLECMD: return 1;
+      case MSG_SELECT_CARD:      return 2;
+      case MSG_SELECT_YESNO:     return 3;
+      case MSG_SELECT_EFFECTYN:  return 4;
+      case MSG_SELECT_CHAIN:     return 5;
+      case MSG_SELECT_POSITION:  return 6;
+      case MSG_SELECT_OPTION:    return 0;  // quirk: 7th dim not emitted
+      default:                   return 0;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // C++ state encoder (obs:state_) — matches state_encoder.py byte-wise.
+  //
+  // State layout (see ADAPTER_CPP_STATE_ENCODER_DESIGN.md §2):
+  //   24  metadata
+  //   1320 bot monsters (5 × 264)
+  //   1295 bot backrow  (5 × 259)
+  //   3084 bot hand     (12 × 257)
+  //    257 bot grave    (count + mean embedding)
+  //    257 bot banished
+  //    257 bot deck
+  //   1320 enemy monsters
+  //   1295 enemy backrow
+  //      1 enemy hand count
+  //      1 enemy deck count
+  //    257 enemy grave
+  //    257 enemy banished
+  //   1030 chain        (4 × 257 + 2)
+  //   ────
+  //  10655 state_dim
+  //
+  // All float32. Offsets must match the Python side EXACTLY; the parity
+  // test (test_cpp_state_encoder_parity.py) checks every dimension.
+  // ════════════════════════════════════════════════════════════════════
+
+  static constexpr int kStateDim = 10655;
+  static constexpr int kEmbDim = 256;
+  static constexpr int kAnnDim = 465;
+  static constexpr int kMaxHandSize = 12;
+  static constexpr int kMaxChainLength = 4;
+  static constexpr int kMonsterSlotDim = 1 + kEmbDim + 7;   // 264
+  static constexpr int kBackrowSlotDim = 1 + kEmbDim + 2;   // 259
+  static constexpr int kHandSlotDim = 1 + kEmbDim;          // 257
+  static constexpr int kPoolDim = 1 + kEmbDim;              // 257
+
+  // Helpers: safe pointer to the (only) contiguous float block of a
+  // TArray<float>. TArray owns a flat buffer; we cast and stride.
+  inline float* state_ptr(TArray<float>& t) {
+    return reinterpret_cast<float*>(t.Data());
+  }
+
+  // obs:cards_ column indices (from ADAPTER_CPP_STATE_ENCODER_DESIGN.md §2)
+  static constexpr int kC_CID_HI = 0, kC_CID_LO = 1;
+  static constexpr int kC_LOC = 2, kC_SEQ = 3, kC_CTRL = 4, kC_POS = 5;
+  static constexpr int kC_OVERLAY = 6;
+  static constexpr int kC_ATK_HI = 12, kC_ATK_LO = 13;
+  static constexpr int kC_DEF_HI = 14, kC_DEF_LO = 15;
+  static constexpr int kC_OWNER = 41, kC_ATTACKED = 42;
+
+  // obs:cards_ location_id values (from location2id in ygopro.h)
+  static constexpr uint8_t kLOC_DECK = 1, kLOC_HAND = 2, kLOC_MZONE = 3;
+  static constexpr uint8_t kLOC_SZONE = 4, kLOC_GRAVE = 5;
+  static constexpr uint8_t kLOC_REMOVED = 6, kLOC_EXTRA = 7;
+
+  // face-up position_id set matching Python's POS_ID_FACEUP_SET = {2,4,5,6}
+  static bool _pos_id_is_faceup(uint8_t pos_id) {
+    return pos_id == 2 || pos_id == 4 || pos_id == 5 || pos_id == 6;
+  }
+
+  // position_id → scalar matching Python's (pi+1)/5 over C# codes {1,4,8,5,10}
+  // See test_position_parity.py for the mapping.
+  static float _pos_id_to_scalar(uint8_t pos_id) {
+    switch (pos_id) {
+      case 2: return 1.0f / 5.0f;  // FACEUP_ATTACK
+      case 5: return 2.0f / 5.0f;  // FACEUP_DEFENSE
+      case 7: return 3.0f / 5.0f;  // FACEDOWN_DEFENSE
+      case 6: return 4.0f / 5.0f;  // FACEUP combined
+      case 8: return 5.0f / 5.0f;  // FACEDOWN combined
+      default: return 0.0f;
+    }
+  }
+
+  // Decode uint16 from obs:cards_ (hi, lo) byte pair → raw integer.
+  static uint16_t _decode_u16(uint8_t hi, uint8_t lo) {
+    return (static_cast<uint16_t>(hi) << 8) | lo;
+  }
+
+  void _set_obs_state(TArray<float>& tstate,
+                      const TArray<uint8_t>& cards_obs,
+                      const TArray<uint8_t>& global_obs,
+                      const TArray<int>& chain_cids,
+                      int decision_type) {
+    float* s = state_ptr(tstate);
+    std::memset(s, 0, kStateDim * sizeof(float));
+    // Guard: if embedding store isn't loaded, leave state_ as zeros.
+    // The training loop must call init_embeddings_store before stepping.
+    if (!exodai::CardEmbeddingStore::is_loaded()) return;
+    const auto& store = exodai::CardEmbeddingStore::get();
+    int off = 0;
+
+    // ── 1. Metadata (24 floats) ──────────────────────────────────────
+    // Read LP from obs:global_ (float-transformed uint16 at [0:4]).
+    s[off++] = _decode_u16(global_obs(0), global_obs(1)) / 8000.0f;
+    s[off++] = _decode_u16(global_obs(2), global_obs(3)) / 8000.0f;
+    s[off++] = static_cast<float>(global_obs(4)) / 30.0f;  // turn / 30
+    // Phase one-hot
+    const int phase_id = static_cast<int>(global_obs(5));
+    if (phase_id >= 1 && phase_id <= 10) s[off + phase_id - 1] = 1.0f;
+    off += 10;
+    // CurrentTurnPlayer relative: global_[7] = is_first_player
+    s[off++] = (global_obs(7) == 1) ? 0.0f : 1.0f;
+    // GameState 7-hot
+    if (decision_type >= 0 && decision_type < 7)
+      s[off + decision_type] = 1.0f;
+    off += 7;
+    // ChainCount raw (from info:chain_cids — count nonzero entries)
+    {
+      int cc = 0;
+      for (int i = 0; i < 8; ++i) {
+        if (chain_cids(i) != 0) ++cc;
+      }
+      s[off++] = static_cast<float>(cc);
+    }
+    s[off++] = 0.0f;  // bot UnderAttack
+    s[off++] = 0.0f;  // enemy UnderAttack
+
+    // Total rows in obs:cards_ = max_cards * 2 = 160.
+    const int n_card_rows = cards_obs.Shape()[0];
+
+    // ── 2. Bot zones (ctrl_rel = 0) ──────────────────────────────────
+    off = _set_state_mzone_from_obs(s, off, cards_obs, n_card_rows, 0, store);
+    off = _set_state_szone_from_obs(s, off, cards_obs, n_card_rows, 0, store);
+    off = _set_state_hand_from_obs(s, off, cards_obs, n_card_rows, 0, store);
+    off = _set_state_pool_from_obs(s, off, cards_obs, n_card_rows, 0, kLOC_GRAVE, store);
+    off = _set_state_pool_from_obs(s, off, cards_obs, n_card_rows, 0, kLOC_REMOVED, store);
+    off = _set_state_pool_from_obs(s, off, cards_obs, n_card_rows, 0, kLOC_DECK, store);
+
+    // ── 3. Enemy zones (ctrl_rel = 1) ────────────────────────────────
+    off = _set_state_mzone_from_obs(s, off, cards_obs, n_card_rows, 1, store);
+    off = _set_state_szone_from_obs(s, off, cards_obs, n_card_rows, 1, store);
+    // Enemy hand + deck counts (/100), read from obs:global_[15..16].
+    s[off++] = static_cast<float>(global_obs(16)) / 100.0f;  // op hand count
+    s[off++] = static_cast<float>(global_obs(15)) / 100.0f;  // op deck count
+    off = _set_state_pool_from_obs(s, off, cards_obs, n_card_rows, 1, kLOC_GRAVE, store);
+    off = _set_state_pool_from_obs(s, off, cards_obs, n_card_rows, 1, kLOC_REMOVED, store);
+
+    // ── 4. Chain (from info:chain_cids) ──────────────────────────────
+    off = _set_state_chain_from_cids(s, off, chain_cids, store);
+
+    if (off != kStateDim) {
+      throw std::runtime_error(
+          fmt::format("_set_obs_state wrote {} floats, expected {}", off, kStateDim));
+    }
+  }
+
+  // ── Obs-based zone encoders ─────────────────────────────────────
+  // All read from obs:cards_ (uint8, 160 rows × 43 cols) instead of
+  // re-querying the engine. Eliminates the position query-race bug.
+
+  int _set_state_mzone_from_obs(
+      float* s, int off, const TArray<uint8_t>& cards,
+      int n_rows, uint8_t ctrl_rel,
+      const exodai::CardEmbeddingStore& store) {
+    std::array<int, 5> slot_row{-1, -1, -1, -1, -1};
+    for (int r = 0; r < n_rows; ++r) {
+      if (cards(r, kC_LOC) != kLOC_MZONE) continue;
+      if (cards(r, kC_CTRL) != ctrl_rel) continue;
+      if (cards(r, kC_OVERLAY)) continue;
+      int seq = static_cast<int>(cards(r, kC_SEQ));
+      if (seq >= 1 && seq <= 5) slot_row[seq - 1] = r;
+    }
+    for (int i = 0; i < 5; ++i) {
+      if (slot_row[i] < 0) { off += kMonsterSlotDim; continue; }
+      const int r = slot_row[i];
+      const uint16_t cid = _decode_u16(cards(r, kC_CID_HI), cards(r, kC_CID_LO));
+      const uint8_t pos_id = cards(r, kC_POS);
+      const bool face_up = _pos_id_is_faceup(pos_id);
+      const bool base_card_visible = (cid > 0);
+
+      s[off] = 1.0f;
+      int slot_off = off + 1;
+      if (base_card_visible) {
+        if (face_up) {
+          CardCode code = _cid_to_code(cid);
+          const float* emb = store.embedding(code);
+          if (emb) std::memcpy(&s[slot_off], emb, kEmbDim * sizeof(float));
+        }
+        slot_off += kEmbDim;
+        s[slot_off + 0] = _decode_u16(cards(r, kC_ATK_HI), cards(r, kC_ATK_LO)) / 8000.0f;
+        s[slot_off + 1] = _decode_u16(cards(r, kC_DEF_HI), cards(r, kC_DEF_LO)) / 8000.0f;
+        s[slot_off + 2] = face_up ? 1.0f : 0.0f;
+        s[slot_off + 3] = _pos_id_to_scalar(pos_id);
+        s[slot_off + 4] = 0.0f;
+        s[slot_off + 5] = (cards(r, kC_ATTACKED) > 0) ? 1.0f : 0.0f;
+        s[slot_off + 6] = (cards(r, kC_OWNER) != cards(r, kC_CTRL)) ? 1.0f : 0.0f;
+      }
+      off += kMonsterSlotDim;
+    }
+    return off;
+  }
+
+  int _set_state_szone_from_obs(
+      float* s, int off, const TArray<uint8_t>& cards,
+      int n_rows, uint8_t ctrl_rel,
+      const exodai::CardEmbeddingStore& store) {
+    std::array<int, 5> slot_row{-1, -1, -1, -1, -1};
+    for (int r = 0; r < n_rows; ++r) {
+      if (cards(r, kC_LOC) != kLOC_SZONE) continue;
+      if (cards(r, kC_CTRL) != ctrl_rel) continue;
+      if (cards(r, kC_OVERLAY)) continue;
+      int seq = static_cast<int>(cards(r, kC_SEQ));
+      if (seq >= 1 && seq <= 5) slot_row[seq - 1] = r;
+    }
+    for (int i = 0; i < 5; ++i) {
+      if (slot_row[i] < 0) { off += kBackrowSlotDim; continue; }
+      const int r = slot_row[i];
+      const uint16_t cid = _decode_u16(cards(r, kC_CID_HI), cards(r, kC_CID_LO));
+      const uint8_t pos_id = cards(r, kC_POS);
+      const bool face_up = _pos_id_is_faceup(pos_id);
+      const bool base_card_visible = (cid > 0);
+
+      s[off] = 1.0f;
+      int slot_off = off + 1;
+      if (base_card_visible) {
+        if (face_up) {
+          CardCode code = _cid_to_code(cid);
+          const float* emb = store.embedding(code);
+          if (emb) std::memcpy(&s[slot_off], emb, kEmbDim * sizeof(float));
+        }
+        slot_off += kEmbDim;
+        s[slot_off + 0] = face_up ? 1.0f : 0.0f;
+        s[slot_off + 1] = face_up ? 0.0f : 1.0f;
+      }
+      off += kBackrowSlotDim;
+    }
+    return off;
+  }
+
+  int _set_state_hand_from_obs(
+      float* s, int off, const TArray<uint8_t>& cards,
+      int n_rows, uint8_t ctrl_rel,
+      const exodai::CardEmbeddingStore& store) {
+    int hand_idx = 0;
+    for (int r = 0; r < n_rows && hand_idx < kMaxHandSize; ++r) {
+      if (cards(r, kC_LOC) != kLOC_HAND) continue;
+      if (cards(r, kC_CTRL) != ctrl_rel) continue;
+      const uint16_t cid = _decode_u16(cards(r, kC_CID_HI), cards(r, kC_CID_LO));
+      s[off] = 1.0f;
+      if (cid > 0) {
+        CardCode code = _cid_to_code(cid);
+        const float* emb = store.embedding(code);
+        if (emb) std::memcpy(&s[off + 1], emb, kEmbDim * sizeof(float));
+      }
+      off += kHandSlotDim;
+      ++hand_idx;
+    }
+    off += (kMaxHandSize - hand_idx) * kHandSlotDim;
+    return off;
+  }
+
+  int _set_state_pool_from_obs(
+      float* s, int off, const TArray<uint8_t>& cards,
+      int n_rows, uint8_t ctrl_rel, uint8_t loc_id,
+      const exodai::CardEmbeddingStore& store) {
+    std::vector<exodai::CardEmbeddingStore::CardCode> codes;
+    for (int r = 0; r < n_rows; ++r) {
+      if (cards(r, kC_LOC) != loc_id) continue;
+      if (cards(r, kC_CTRL) != ctrl_rel) continue;
+      const uint16_t cid = _decode_u16(cards(r, kC_CID_HI), cards(r, kC_CID_LO));
+      if (cid > 0) codes.push_back(_cid_to_code(cid));
+      else codes.push_back(0);
+    }
+    s[off++] = static_cast<float>(codes.size()) / 100.0f;
+    if (!codes.empty()) store.mean_embedding(codes, &s[off]);
+    off += kEmbDim;
+    return off;
+  }
+
+  int _set_state_chain_from_cids(
+      float* s, int off, const TArray<int>& chain_cids,
+      const exodai::CardEmbeddingStore& store) {
+    int chain_count = 0;
+    for (int i = 0; i < 8; ++i)
+      if (chain_cids(i) != 0) ++chain_count;
+    s[off++] = static_cast<float>(chain_count);
+    s[off++] = -1.0f;
+    for (int i = 0; i < kMaxChainLength; ++i) {
+      if (i < chain_count) {
+        const uint16_t cid = static_cast<uint16_t>(chain_cids(i));
+        const CardCode code = _cid_to_code(cid);
+        const float* emb = store.embedding(code);
+        if (emb) std::memcpy(&s[off], emb, kEmbDim * sizeof(float));
+        off += kEmbDim;
+        s[off++] = 1.0f;
+      } else {
+        off += kEmbDim + 1;
+      }
+    }
+    return off;
+  }
+
+  // O(1) reverse lookup with bounds checking. Returns 0 for out-of-range
+  // or unknown cids (which the embedding store handles as a zero-vector).
+  // Never iterates card_ids_ — uses the prebuilt reverse vector.
+  static CardCode _cid_to_code(uint16_t cid) {
+    if (cid_to_code_.empty() || cid == 0 ||
+        static_cast<size_t>(cid) >= cid_to_code_.size()) {
+      return 0;
+    }
+    return cid_to_code_[cid];
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Events encoder: (64, 306) + mask. Mirrors
+  // state_encoder.py::_encode_events.
+  //
+  // Row layout (306 floats):
+  //    [0..8]    event_type_onehot (9 dims)
+  //    [9..264]  card embedding (256 dims)
+  //    [265..284] from_loc_onehot (20 dims, matches EVENT_LOCATIONS)
+  //    [285..304] to_loc_onehot (20 dims)
+  //    [305]     player flag (0 or 1, already relative to to_play)
+  //
+  // The raw ring buffer in events_ring_ already has player relativized
+  // at WriteState time; here we just translate the type_id / loc ids
+  // into one-hot positions and apply the embedding lookup.
+  // ════════════════════════════════════════════════════════════════════
+
+  static constexpr int kNumEventTypes = 9;
+  static constexpr int kNumEventLocations = 20;
+  static constexpr int kEventDim =
+      kNumEventTypes + kEmbDim + 2 * kNumEventLocations + 1;  // = 306
+
+  void _set_obs_events_encoded(TArray<float>& tevents, TArray<float>& tmask) {
+    float* ev = reinterpret_cast<float*>(tevents.Data());
+    float* mk = reinterpret_cast<float*>(tmask.Data());
+    std::memset(ev, 0, kMaxEventsInRing * kEventDim * sizeof(float));
+    std::memset(mk, 0, kMaxEventsInRing * sizeof(float));
+
+    if (!exodai::CardEmbeddingStore::is_loaded()) return;
+    const auto& store = exodai::CardEmbeddingStore::get();
+    const int start = (events_head_ - events_count_ + kMaxEventsInRing)
+                      % kMaxEventsInRing;
+    for (int i = 0; i < events_count_; ++i) {
+      const auto& e = events_ring_[(start + i) % kMaxEventsInRing];
+      float* row = ev + i * kEventDim;
+      int o = 0;
+
+      // Event type one-hot
+      if (e.type < kNumEventTypes) {
+        row[o + e.type] = 1.0f;
+      }
+      o += kNumEventTypes;
+
+      // Embedding — look up the raw CardCode. Apply the same info-
+      // hiding rule as the raw obs:events_ stream: opponent draws
+      // get zeroed so the observer can't reconstruct hidden info.
+      CardCode code = e.code;
+      if (e.type == static_cast<uint8_t>(EventType::Draw) &&
+          e.abs_player != to_play_) {
+        code = 0;
+      }
+      if (code != 0) {
+        const float* emb = store.embedding(code);
+        if (emb != nullptr) {
+          std::memcpy(row + o, emb, kEmbDim * sizeof(float));
+        }
+      }
+      o += kEmbDim;
+
+      // From location one-hot
+      if (e.from_loc < kNumEventLocations) {
+        row[o + e.from_loc] = 1.0f;
+      }
+      o += kNumEventLocations;
+
+      // To location one-hot
+      if (e.to_loc < kNumEventLocations) {
+        row[o + e.to_loc] = 1.0f;
+      }
+      o += kNumEventLocations;
+
+      // Player flag — events_ring_ stores abs_player; relativize now.
+      row[o] = (e.abs_player != to_play_) ? 1.0f : 0.0f;
+
+      mk[i] = 1.0f;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Action encoder: (40, 745) + mask. Mirrors Python adapter's
+  // _encode_actions_direct. Reads from obs:actions_ (24, 12) uint8 and
+  // obs:cards_ for spec_index → location lookup.
+  //
+  // Row layout (745 floats = action_dim):
+  //   [0..255]   card embedding (256)
+  //   [256..720] annotation features (465)
+  //   [721..733] action type one-hot (13)
+  //   [734..740] location one-hot (7)
+  //   [741..744] extra context (4): [-4]=pos/opt, [-3]=chain_pass,
+  //                                  [-2]=yes/no, [-1]=phase marker
+  // ════════════════════════════════════════════════════════════════════
+
+  static constexpr int kActionDim = 745;
+  static constexpr int kMaxActions = 40;
+  static constexpr int kNumActionTypes = 13;
+  static constexpr int kNumLocations = 7;
+
+  // obs:actions_ column indices (from the raw 12-col layout)
+  static constexpr int kA_SPEC = 0;
+  static constexpr int kA_CID_HI = 1, kA_CID_LO = 2;
+  static constexpr int kA_MSG = 3, kA_ACT = 4, kA_FINISH = 5;
+  static constexpr int kA_PHASE = 7, kA_POSITION = 8;
+
+  // msg2id values (from _msgs in ygopro.h, 1-based)
+  static constexpr int kMSG_IDLECMD = 1, kMSG_CHAIN = 2;
+  static constexpr int kMSG_CARD = 3, kMSG_TRIBUTE = 4;
+  static constexpr int kMSG_POSITION = 5, kMSG_EFFECTYN = 6;
+  static constexpr int kMSG_YESNO = 7, kMSG_BATTLECMD = 8;
+  static constexpr int kMSG_UNSELECT = 9, kMSG_OPTION = 10;
+  static constexpr int kMSG_SUM = 12;
+
+  // ActionAct enum values
+  static constexpr int kACT_NONE = 0, kACT_SET = 1, kACT_REPO = 2;
+  static constexpr int kACT_SPSUMMON = 3, kACT_SUMMON = 4, kACT_MSET = 5;
+  static constexpr int kACT_ATTACK = 6, kACT_DATTACK = 7;
+  static constexpr int kACT_ACTIVATE = 8, kACT_CANCEL = 9;
+
+  // (msg, act) → action_type index. Returns -1 for "no match".
+  static int _action_type_index(int msg, int act) {
+    if (msg == kMSG_IDLECMD) {
+      switch (act) {
+        case kACT_SUMMON:   return 0;  // normal_summon
+        case kACT_MSET:     return 1;  // set_monster
+        case kACT_SPSUMMON: return 2;  // special_summon
+        case kACT_ACTIVATE: return 3;  // activate
+        case kACT_SET:      return 4;  // set_spell
+        case kACT_REPO:     return 5;  // reposition
+        default:            return 7;  // phase_change
+      }
+    }
+    if (msg == kMSG_BATTLECMD) {
+      if (act == kACT_ATTACK || act == kACT_DATTACK) return 6;  // attack
+      if (act == kACT_ACTIVATE) return 3;  // activate
+      return 7;  // phase_change
+    }
+    if (msg == kMSG_CARD || msg == kMSG_TRIBUTE ||
+        msg == kMSG_SUM || msg == kMSG_UNSELECT)
+      return 8;  // select_card
+    if (msg == kMSG_CHAIN)    return 9;   // chain
+    if (msg == kMSG_YESNO || msg == kMSG_EFFECTYN) return 10; // yes_no
+    if (msg == kMSG_POSITION) return 11;  // position
+    if (msg == kMSG_OPTION)   return 12;  // option
+    return -1;
+  }
+
+  // location_id (from obs:cards_[r][2]) → LOCATIONS index (0..6).
+  // ygoenv location_id is 1-based; LOCATIONS index is 0-based; off by 1.
+  static int _loc_id_to_index(uint8_t loc_id) {
+    if (loc_id >= 1 && loc_id <= 7) return loc_id - 1;
+    return -1;
+  }
+
+  void _set_obs_actions_encoded(
+      TArray<float>& tactions, TArray<float>& tmask,
+      const TArray<uint8_t>& raw_actions,
+      const TArray<uint8_t>& cards_obs,
+      int n_options) {
+    float* a = reinterpret_cast<float*>(tactions.Data());
+    float* m = reinterpret_cast<float*>(tmask.Data());
+    std::memset(a, 0, kMaxActions * kActionDim * sizeof(float));
+    std::memset(m, 0, kMaxActions * sizeof(float));
+
+    if (!exodai::CardEmbeddingStore::is_loaded()) return;
+    const auto& store = exodai::CardEmbeddingStore::get();
+    const int n = std::min(n_options, kMaxActions);
+    const int n_card_rows = cards_obs.Shape()[0];
+
+    // Offsets within the 745-dim action row
+    const int ann_start = kEmbDim;             // 256
+    const int at_start = kEmbDim + kAnnDim;    // 721
+    const int loc_start = at_start + kNumActionTypes;  // 734
+    // Extra context: last 4 floats = [741, 742, 743, 744]
+
+    for (int i = 0; i < n; ++i) {
+      float* row = a + i * kActionDim;
+
+      const uint16_t cid = _decode_u16(raw_actions(i, kA_CID_HI),
+                                        raw_actions(i, kA_CID_LO));
+      const int msg = static_cast<int>(raw_actions(i, kA_MSG));
+      const int act = static_cast<int>(raw_actions(i, kA_ACT));
+      const int spec_index = static_cast<int>(raw_actions(i, kA_SPEC));
+      const int phase_marker = static_cast<int>(raw_actions(i, kA_PHASE));
+      const int position_id = static_cast<int>(raw_actions(i, kA_POSITION));
+
+      // ── Card embedding + annotation ──────────────────────────────
+      if (cid > 0) {
+        const CardCode code = _cid_to_code(cid);
+        if (code > 0) {
+          const float* emb = store.embedding(code);
+          if (emb) std::memcpy(row, emb, kEmbDim * sizeof(float));
+          const float* ann = store.annotation(code);
+          if (ann) std::memcpy(row + ann_start, ann, kAnnDim * sizeof(float));
+        }
+      }
+
+      // ── Action type one-hot ──────────────────────────────────────
+      const int at_idx = _action_type_index(msg, act);
+      if (at_idx >= 0 && at_idx < kNumActionTypes) {
+        row[at_start + at_idx] = 1.0f;
+      }
+
+      // ── Location one-hot (from spec_index → cards_[spec-1][LOC]) ─
+      if (spec_index > 0 && spec_index <= n_card_rows) {
+        const uint8_t source_loc = cards_obs(spec_index - 1, kC_LOC);
+        const int loc_idx = _loc_id_to_index(source_loc);
+        if (loc_idx >= 0 && loc_idx < kNumLocations) {
+          row[loc_start + loc_idx] = 1.0f;
+        }
+      }
+
+      // ── Extra context floats (last 4 positions) ──────────────────
+      if (msg == kMSG_POSITION) {
+        row[kActionDim - 4] = position_id / 10.0f;
+      } else if (msg == kMSG_CHAIN && act == kACT_CANCEL) {
+        row[kActionDim - 3] = 1.0f;
+      } else if (msg == kMSG_YESNO || msg == kMSG_EFFECTYN) {
+        row[kActionDim - 2] = (act == kACT_ACTIVATE) ? 1.0f : 0.0f;
+      } else if ((msg == kMSG_IDLECMD || msg == kMSG_BATTLECMD) &&
+                  act == kACT_NONE) {
+        if (phase_marker == 1)      row[kActionDim - 1] = 0.33f;
+        else if (phase_marker == 2) row[kActionDim - 1] = 0.66f;
+        else if (phase_marker == 3) row[kActionDim - 1] = 1.0f;
+      }
+
+      m[i] = 1.0f;
     }
   }
 
@@ -2462,7 +3347,7 @@ private:
             if (!hide) {
               card_id = c_get_card_id(c.code_);
             }
-            _set_obs_card_(f_cards, offset, c, hide);
+            _set_obs_card_(f_cards, offset, c, hide, card_id);
             offset++;
 
             spec_infos[spec] = {static_cast<uint16_t>(offset), card_id};
@@ -2610,6 +3495,25 @@ private:
       auto type_ids = type_to_ids(c.type_);
       for (int j = 0; j < type_ids.size(); ++j) {
         f_cards(offset, 16 + j) = type_ids[j];
+      }
+    }
+
+    // ── Engine pointer access: owner + attacked_count ─────────────────
+    // Both fields exist on the engine `card` struct (card.h:158/171) but
+    // are not exposed via QUERY_* flags. We reach into game_field directly.
+    // Skipped for overlay (XYZ material) cards because get_field_card on
+    // a material's slot returns the host XYZ monster, not the material.
+    if (!hide && !overlay &&
+        (location == LOCATION_MZONE || location == LOCATION_SZONE)) {
+      duel *d = (duel *)pduel_;
+      ::card *engine_card = d->game_field->get_field_card(
+          c.controler_, location, c.sequence_);
+      if (engine_card != nullptr) {
+        uint8_t owner_seat = engine_card->owner;
+        f_cards(offset, 41) =
+            global ? owner_seat
+                   : ((owner_seat != to_play_) ? 1 : 0);
+        f_cards(offset, 42) = engine_card->attacked_count;
       }
     }
   }
@@ -2867,9 +3771,27 @@ private:
   }
 
   // ygopro-core API
+  //
+  // Thread-safety fix: ygopro-core has hidden shared mutable state that
+  // causes segfaults when multiple duels run concurrently (verified:
+  // num_threads=1 never crashes, num_threads=2 crashes at ~2400 games,
+  // num_threads=16 crashes at ~850 games). The exact data race hasn't
+  // been pinpointed to a specific variable, but empirically it's in the
+  // duel processing/creation path (process(), new duel(), new_card()).
+  //
+  // This mutex serializes those calls. Observation queries, action
+  // responses, and player info are left unlocked (they operate on
+  // per-duel state only). With 128 envs and 16 threads, throughput is
+  // ~2500 GPM — the mutex serializes ~1ms process() calls but the
+  // thread pool still parallelizes Python-side work and env resets.
+  static std::mutex& core_mutex() {
+    static std::mutex mtx;
+    return mtx;
+  }
+
   intptr_t YGO_CreateDuel(uint32_t seed) {
+    std::lock_guard<std::mutex> lock(core_mutex());
     std::mt19937 rnd(seed);
-    // return create_duel(rnd());
     duel* pduel = new duel();
     pduel->random.reset(rnd());
     return (intptr_t)pduel;
@@ -2880,6 +3802,7 @@ private:
   }
 
   void YGO_NewCard(intptr_t pduel, uint32 code, uint8 owner, uint8 playerid, uint8 location, uint8 sequence, uint8 position) const {
+    std::lock_guard<std::mutex> lock(core_mutex());
     new_card(pduel, code, owner, playerid, location, sequence, position);
   }
 
@@ -2888,7 +3811,7 @@ private:
   }
 
   void YGO_EndDuel(intptr_t pduel) const {
-    // end_duel(pduel);
+    std::lock_guard<std::mutex> lock(core_mutex());
     duel* pd = (duel*)pduel;
     delete pd;
   }
@@ -2898,6 +3821,7 @@ private:
   }
 
   uint32 YGO_Process(intptr_t pduel) {
+    std::lock_guard<std::mutex> lock(core_mutex());
     return process(pduel);
   }
 
@@ -3308,28 +4232,36 @@ private:
     }
 
     if (msg_ == MSG_DRAW) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       auto player = read_u8();
       auto drawed = read_u8();
       std::vector<uint32> codes;
+      codes.reserve(drawed);
       for (int i = 0; i < drawed; ++i) {
         uint32 code = read_u32();
         codes.push_back(code & 0x7fffffff);
       }
-      const auto &pl = players_[player];
-      pl->notify(fmt::format("Drew {} cards:", drawed));
-      for (int i = 0; i < drawed; ++i) {
-        const auto &c = c_get_card(codes[i]);
-        pl->notify(fmt::format("{}: {}", i + 1, c.name_));
+      // Push one Draw event per card so StateEncoder sees each draw as a
+      // discrete event (matching the C# bridge semantics). Info-hiding is
+      // applied at WriteState by zeroing cid for opponent draws.
+      for (uint32 code : codes) {
+        push_event(EventType::Draw, code, player,
+                   EVENT_LOC_DECK, EVENT_LOC_HAND);
       }
-      const auto &op = players_[1 - player];
-      op->notify(fmt::format("Opponent drew {} cards.", drawed));
+      if (verbose_) {
+        const auto &pl = players_[player];
+        pl->notify(fmt::format("Drew {} cards:", drawed));
+        for (int i = 0; i < drawed; ++i) {
+          const auto &c = c_get_card(codes[i]);
+          pl->notify(fmt::format("{}: {}", i + 1, c.name_));
+        }
+        const auto &op = players_[1 - player];
+        op->notify(fmt::format("Opponent drew {} cards.", drawed));
+      }
     } else if (msg_ == MSG_NEW_TURN) {
       tp_ = int(read_u8());
       turn_count_++;
+      push_event(EventType::TurnChange, 0, static_cast<uint8_t>(tp_),
+                 EVENT_LOC_NONE, EVENT_LOC_NONE);
       if (!verbose_) {
         return;
       }
@@ -3338,6 +4270,8 @@ private:
       players_[1 - tp_]->notify(fmt::format("{}'s turn.", player->nickname_));
     } else if (msg_ == MSG_NEW_PHASE) {
       current_phase_ = int(read_u16());
+      push_event(EventType::PhaseChange, 0, static_cast<uint8_t>(tp_),
+                 EVENT_LOC_NONE, ygo_phase_to_event_loc(current_phase_));
       if (!verbose_) {
         return;
       }
@@ -3346,10 +4280,6 @@ private:
         players_[i]->notify(fmt::format("Entering {} phase.", phase_str));
       }
     } else if (msg_ == MSG_MOVE) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       CardCode code = read_u32();
       uint32_t location = read_u32();
       uint32_t newloc = read_u32();
@@ -3358,6 +4288,15 @@ private:
       card.set_location(location);
       Card cnew = c_get_card(code);
       cnew.set_location(newloc);
+      // Emit card_moved event unconditionally. The C# bridge emits an
+      // equivalent event for every zone transition.
+      push_event(EventType::CardMoved, code, card.controler_,
+                 ygo_location_to_event_loc(location),
+                 ygo_location_to_event_loc(newloc),
+                 static_cast<uint8_t>(reason & 0xff));
+      if (!verbose_) {
+        return;
+      }
       auto& pl = players_[card.controler_];
       auto& op = players_[1 - card.controler_];
 
@@ -3493,15 +4432,18 @@ private:
         }
       }
     } else if (msg_ == MSG_SET) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       CardCode code = read_u32();
       uint32_t location = read_u32();
       Card card = c_get_card(code);
       card.set_location(location);
       auto c = card.controler_;
+      // card.location_ is the target zone (usually SZONE for spell/trap set).
+      push_event(EventType::Set, code, c,
+                 EVENT_LOC_HAND,
+                 ygo_location_to_event_loc(location));
+      if (!verbose_) {
+        return;
+      }
       auto& cpl = players_[c];
       auto& opl = players_[1 - c];
       cpl->notify(fmt::format("You set {} ({}) in {} position.", card.name_,
@@ -3920,13 +4862,16 @@ private:
     } else if (msg_ == MSG_SUMMONED) {
       dp_ = dl_;
     } else if (msg_ == MSG_SUMMONING) {
+      CardCode code = read_u32();
+      uint32_t location = read_u32();
+      Card card = c_get_card(code);
+      card.set_location(location);
+      push_event(EventType::Summon, code, card.controler_,
+                 EVENT_LOC_HAND,
+                 ygo_location_to_event_loc(location));
       if (!verbose_) {
-        dp_ = dl_;
         return;
       }
-      CardCode code = read_u32();
-      Card card = c_get_card(code);
-      card.set_location(read_u32());
       const auto &nickname = players_[card.controler_]->nickname_;
       for (auto& pl : players_) {
         pl->notify(nickname + " summoning " + card.name_ + " (" +
@@ -3939,16 +4884,18 @@ private:
     } else if (msg_ == MSG_FLIPSUMMONED) {
       dp_ = dl_;
     } else if (msg_ == MSG_FLIPSUMMONING) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
-
       auto code = read_u32();
       auto location = read_u32();
       Card card = c_get_card(code);
       card.set_location(location);
-
+      // Flip summon: the card was already on the field face-down.
+      // from_loc = current zone (monster), to_loc = same zone (now face-up).
+      push_event(EventType::Summon, code, card.controler_,
+                 ygo_location_to_event_loc(location),
+                 ygo_location_to_event_loc(location));
+      if (!verbose_) {
+        return;
+      }
       auto& cpl = players_[card.controler_];
       for (PlayerId pl = 0; pl < 2; pl++) {
         auto spec = card.get_spec(pl);
@@ -3956,13 +4903,19 @@ private:
                                  " (" + card.name_ + ")");
       }
     } else if (msg_ == MSG_SPSUMMONING) {
+      CardCode code = read_u32();
+      uint32_t location = read_u32();
+      Card card = c_get_card(code);
+      card.set_location(location);
+      // Special summons can come from many zones (hand, grave, banished,
+      // extra). Use UNKNOWN for from_loc when the actual source isn't
+      // derivable from this single message.
+      push_event(EventType::Summon, code, card.controler_,
+                 EVENT_LOC_UNKNOWN,
+                 ygo_location_to_event_loc(location));
       if (!verbose_) {
-        dp_ = dl_;
         return;
       }
-      CardCode code = read_u32();
-      Card card = c_get_card(code);
-      card.set_location(read_u32());
       const auto &nickname = players_[card.controler_]->nickname_;
       for (PlayerId p = 0; p < 2; p++) {
         auto& pl = players_[p];
@@ -3992,21 +4945,31 @@ private:
     } else if (msg_ == MSG_CHAIN_END) {
       dp_ = dl_;
     } else if (msg_ == MSG_CHAINING) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       CardCode code = read_u32();
+      uint32_t location = read_u32();
       Card card = c_get_card(code);
-      card.set_location(read_u32());
+      card.set_location(location);
       auto tc = read_u8();
       auto tl = read_u8();
       auto ts = read_u8();
       uint32_t desc = read_u32();
       auto cs = read_u8();
       auto c = card.controler_;
-      PlayerId o = 1 - c;
       chaining_player_ = c;
+      // Activate vs Chain disambiguation: ygopro-core pushes to
+      // core.current_chain *before* emitting MSG_CHAINING, so this link is
+      // always already in the stack. size == 1 means we're the opening link
+      // (Activate); size > 1 means we're a response (Chain).
+      const auto &cur_chain = ((duel *)pduel_)->game_field->core.current_chain;
+      EventType etype = (cur_chain.size() <= 1) ? EventType::Activate
+                                                : EventType::Chain;
+      push_event(etype, code, c,
+                 ygo_location_to_event_loc(location),
+                 ygo_location_to_event_loc(location));
+      if (!verbose_) {
+        return;
+      }
+      PlayerId o = 1 - c;
       players_[c]->notify("Activating " + card.get_spec(c) + " (" + card.name_ +
                           ")");
       players_[o]->notify(players_[c]->nickname_ + " activating " +
@@ -4041,10 +5004,6 @@ private:
           pl->nickname_ + " pays " + std::to_string(cost) + " LP. " +
           pl->nickname_ + "'s LP is now " + std::to_string(lp_[player]) + ".");
     } else if (msg_ == MSG_ATTACK) {
-      if (!verbose_) {
-        dp_ = dl_;
-        return;
-      }
       auto attacker = read_u32();
       PlayerId ac = attacker & 0xff;
       auto aloc = (attacker >> 8) & 0xff;
@@ -4055,6 +5014,23 @@ private:
       auto tloc = (target >> 8) & 0xff;
       auto tseq = (target >> 16) & 0xff;
       auto tpos = (target >> 24) & 0xff;
+
+      // Push attack event. For direct attacks, target is all-zero; the
+      // event's to_loc reads EVENT_LOC_NONE in that case.
+      bool direct_attack = (tc == 0 && tloc == 0 && tseq == 0 && tpos == 0);
+      CardCode attacker_code = 0;
+      try {
+        attacker_code = get_card_code(ac, aloc, aseq);
+      } catch (...) {
+        attacker_code = 0;
+      }
+      push_event(EventType::Attack, attacker_code, ac,
+                 ygo_location_to_event_loc(aloc),
+                 direct_attack ? EVENT_LOC_NONE : ygo_location_to_event_loc(tloc));
+
+      if (!verbose_) {
+        return;
+      }
 
       if ((ac == 0) && (aloc == 0) && (aseq == 0) && (apos == 0)) {
         return;
