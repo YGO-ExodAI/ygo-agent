@@ -34,6 +34,14 @@
 // access to the duel's `cards` set + temp_card filter.
 #include "edopro-core/duel.h"
 #include "edopro-core/field.h"
+// Chunk 9b followup: refuse_reason recovery on save refuse path.
+// Forward-declare rather than #include because save_state.h uses
+// relative paths ("../ocgapi_types.h") that don't resolve in the
+// flat install dir of edopro-core package.
+namespace ocg { namespace serialize {
+OCG_SaveStatus serialize_duel(const duel& d, std::string* out,
+                               std::string* refuse_reason);
+}}
 
 // Shared with ygopro wrapper — moved to common/ during B.3.a Chunk 1.
 #include "ygoenv/common/card_embedding_store.h"
@@ -3820,10 +3828,22 @@ private:
     int status = OCG_DuelSaveState(pduel_, &blob, &size);
     if (status != OCG_SAVE_OK) {
       if (blob != nullptr) OCG_FreeSaveBuffer(blob);
-      throw std::runtime_error(
-          std::string("OCG_DuelSaveState refused (status=") +
-          std::to_string(status) +
-          "). Re-run via the C++ entry point to recover refuse_reason.");
+      // Chunk 9b followup: re-run via the C++ entry point to recover
+      // refuse_reason. The C API drops it; the C++ ocg::serialize::
+      // serialize_duel signature has it as an out-param. Cost is one
+      // duplicate save attempt on the refuse path only — OK saves
+      // never run this branch. Lets Python-side classification (e.g.
+      // measure_envpool_save_corpus.py) read the actual refuse reason
+      // string instead of just the status code.
+      auto* d = static_cast<duel*>(pduel_);
+      std::string out_dup, reason_dup;
+      ocg::serialize::serialize_duel(*d, &out_dup, &reason_dup);
+      std::string msg = "OCG_DuelSaveState refused (status=" +
+                        std::to_string(status) + ")";
+      if (!reason_dup.empty()) {
+        msg += ": " + reason_dup;
+      }
+      throw std::runtime_error(msg);
     }
     std::string ret(static_cast<const char*>(blob), size);
     OCG_FreeSaveBuffer(blob);
