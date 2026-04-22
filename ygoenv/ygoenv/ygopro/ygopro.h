@@ -36,7 +36,8 @@
 #include "ygopro-core/card.h"
 #include "ygopro-core/field.h"
 
-#include "ygoenv/ygopro/card_embedding_store.h"
+// Moved to ygoenv/ygoenv/common/ during B.3.a so both wrappers share it.
+#include "ygoenv/common/card_embedding_store.h"
 
 // clang-format on
 
@@ -3779,8 +3780,11 @@ private:
   // been pinpointed to a specific variable, but empirically it's in the
   // duel processing/creation path (process(), new duel(), new_card()).
   //
-  // This mutex serializes those calls. Observation queries, action
-  // responses, and player info are left unlocked (they operate on
+  // This mutex serializes those calls, plus start_duel() (added 2026-04-18
+  // after a segfault at ~89K games on num_threads=4 — start_duel was the
+  // only remaining duel-setup call left unlocked, and it loads Lua card
+  // scripts during continuous-effect registration). Observation queries,
+  // action responses, and player info are left unlocked (they operate on
   // per-duel state only). With 128 envs and 16 threads, throughput is
   // ~2500 GPM — the mutex serializes ~1ms process() calls but the
   // thread pool still parallelizes Python-side work and env resets.
@@ -3807,6 +3811,12 @@ private:
   }
 
   void YGO_StartDuel(intptr_t pduel, int32 options) const {
+    // Locked for the same reason as NewCard/Process: start_duel registers
+    // continuous card effects (loads Lua scripts) and shuffles the deck.
+    // Script registration is the remaining unlocked path that fits the
+    // empirical "segfaults after N*thread games" pattern documented on
+    // core_mutex() above. Called once per game, so cost is negligible.
+    std::lock_guard<std::mutex> lock(core_mutex());
     start_duel(pduel, options);
   }
 
