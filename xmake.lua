@@ -155,6 +155,25 @@ target("serialize_test_save")
     -- overlay).
     add_packages("edopro-core", "protobuf-cpp")
 
+-- Chunk 6 — corpus refuse-rate measurement binary. Long-running (~10
+-- minutes for the full ~13K-card manifest), so it lives in its own
+-- target instead of inflating serialize_test_save runtime. Per-run
+-- output is the §11.1 ladder classification.
+--
+-- Prereq: python3 data_pipeline/build_corpus_refuse_manifest.py
+-- Run: xmake run serialize_chunk6_corpus_measure [max_cards]
+target("serialize_chunk6_corpus_measure")
+    set_kind("binary")
+    set_languages("c++17")
+    set_default(false)
+    on_load(function (target)
+        os.execv("make", {"-C", "/mnt/c/Users/Joe/Documents/edopro/edopro/ocgcore/serialize", "proto"})
+    end)
+    add_files(ocgcore_serialize .. "/tests/measure_corpus_refuse.cpp")
+    add_files(ocgcore_serialize .. "/ocg_state.pb.cc")
+    add_includedirs(ocgcore_serialize, ocgcore_serialize .. "/..")
+    add_packages("edopro-core", "protobuf-cpp")
+
 target("alphazero_mcts")
     add_rules("python.library")
     add_files("mcts/mcts/alphazero/*.cpp")
