@@ -174,6 +174,24 @@ target("serialize_chunk6_corpus_measure")
     add_includedirs(ocgcore_serialize, ocgcore_serialize .. "/..")
     add_packages("edopro-core", "protobuf-cpp")
 
+-- Chunk 5c.0 — refuse-case characterization. Walks every refused card
+-- from /tmp/chunk6_refuse_details.csv and emits structural diagnostic
+-- data via the Lua C API directly (function nups, table pointers,
+-- metatable presence). Drives the §13.4 extension-scope estimate.
+--
+-- Run: xmake run serialize_5c0_characterize [unk_upval_cap]
+target("serialize_5c0_characterize")
+    set_kind("binary")
+    set_languages("c++17")
+    set_default(false)
+    on_load(function (target)
+        os.execv("make", {"-C", "/mnt/c/Users/Joe/Documents/edopro/edopro/ocgcore/serialize", "proto"})
+    end)
+    add_files(ocgcore_serialize .. "/tests/measure_5c0_characterize.cpp")
+    add_files(ocgcore_serialize .. "/ocg_state.pb.cc")
+    add_includedirs(ocgcore_serialize, ocgcore_serialize .. "/..")
+    add_packages("edopro-core", "protobuf-cpp")
+
 target("alphazero_mcts")
     add_rules("python.library")
     add_files("mcts/mcts/alphazero/*.cpp")
