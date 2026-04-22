@@ -30,6 +30,10 @@
 #include "edopro-core/common.h"
 #include "edopro-core/card.h"
 #include "edopro-core/ocgapi.h"
+// Phase P1 Primitive 1, Chunk 7: needed for GetStateCardCodes — direct
+// access to the duel's `cards` set + temp_card filter.
+#include "edopro-core/duel.h"
+#include "edopro-core/field.h"
 
 // Shared with ygopro wrapper — moved to common/ during B.3.a Chunk 1.
 #include "ygoenv/common/card_embedding_store.h"
@@ -2143,6 +2147,73 @@ public:
            play_modes_.end();
   }
 
+  // Phase P1 Primitive 1, Chunk 7 — env-level save/load.
+  //
+  // SaveState: forwards to YGO_SaveState (handles core_mutex). Returns
+  // raw blob bytes; the Python sidecar layer (state_io.py) is what
+  // adds JSON metadata + script-corpus hash.
+  //
+  // LoadState: replaces pduel_ via YGO_LoadState, then resets the
+  // adapter-side per-env caches that key off pduel_ identity (event
+  // log, chain stack, multi-select state, action history). The duel
+  // is now in the saved state — caller can step it normally.
+  //
+  // Note: episode-level fields (turn_count_, play_mode_, ai_player_,
+  // done_, lp_, tp_, current_phase_) are deliberately NOT reset here.
+  // Those are part of the engine state being restored — turn_count_
+  // for example is implicit in the saved field state. If a load
+  // fixture needs them set explicitly, the JSON sidecar carries them.
+  std::string SaveState() {
+    return YGO_SaveState();
+  }
+
+  // Returns the konami codes of all cards currently allocated in the
+  // env's duel. Used by Chunk 7's script-corpus hash to identify which
+  // c<id>.lua scripts contributed to the state, so the sidecar can
+  // record per-card hashes for drift detection at load time.
+  //
+  // Includes ALL cards regardless of zone (deck, hand, field, GY,
+  // banished, extra, overlay) — anything in duel.cards. Excludes
+  // field.temp_card (the engine-internal scratch slot).
+  std::vector<uint32_t> GetStateCardCodes() {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    std::vector<uint32_t> codes;
+    if (pduel_ == nullptr) return codes;
+    auto* d = static_cast<duel*>(pduel_);
+    codes.reserve(d->cards.size());
+    card* tc = d->game_field ? d->game_field->temp_card : nullptr;
+    for (card* c : d->cards) {
+      if (c == nullptr || c == tc) continue;
+      codes.push_back(c->data.code);
+    }
+    return codes;
+  }
+
+  void LoadState(const std::string& blob) {
+    YGO_LoadState(blob);
+    // Reset adapter-side per-env caches. Subset of Reset() that
+    // applies to "loaded into a new state" rather than "starting a
+    // fresh game".
+    for (auto& e : events_ring_) e = EventRecord{};
+    events_head_ = 0;
+    events_count_ = 0;
+    chain_stack_.clear();
+    ms_idx_ = -1;
+    ms_specs_.clear();
+    ms_combs_.clear();
+    ms_spec2idx_.clear();
+    ms_r_idxs_.clear();
+    history_actions_0_.Zero();
+    history_actions_1_.Zero();
+    ha_p_0_ = 0;
+    ha_p_1_ = 0;
+    // Mark duel started + active so the next Step doesn't try to
+    // re-CreateDuel. The caller is expected to drive the loaded state
+    // forward via the normal Send/Recv loop.
+    duel_started_ = true;
+    done_ = false;
+  }
+
   void Reset() override {
     // clock_t start = clock();
     if (random_mode()) {
@@ -3721,6 +3792,76 @@ private:
   void YGO_EndDuel(OCG_Duel pduel) {
     std::lock_guard<std::mutex> lock(core_mutex());
     OCG_DestroyDuel(pduel);
+  }
+
+  // ---------------------------------------------------------------------
+  // Phase P1 Primitive 1, Chunk 7: per-env save/load state.
+  //
+  // SaveState: serializes pduel_'s engine state (RNG, players, cards,
+  // effects, groups, chain, processor, Lua callbacks per chunk-5c) to
+  // a protobuf blob. Returns the blob as a std::string. Caller wraps
+  // in py::bytes at the pybind layer.
+  //
+  // LoadState: tears down the current pduel_, builds a fresh OCG_Duel
+  // from the blob with the same callbacks (g_DataReader/g_ScriptReader/
+  // g_LogHandler), assigns to pduel_. Caller is responsible for
+  // resetting any adapter-side caches that key off pduel_ identity
+  // (handled at the Env::LoadState wrapper, not here).
+  //
+  // Both bracketed by core_mutex like the rest of the engine API.
+  // ---------------------------------------------------------------------
+  std::string YGO_SaveState() {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    if (pduel_ == nullptr) {
+      throw std::runtime_error("YGO_SaveState: pduel is null");
+    }
+    void* blob = nullptr;
+    uint32_t size = 0;
+    int status = OCG_DuelSaveState(pduel_, &blob, &size);
+    if (status != OCG_SAVE_OK) {
+      if (blob != nullptr) OCG_FreeSaveBuffer(blob);
+      throw std::runtime_error(
+          std::string("OCG_DuelSaveState refused (status=") +
+          std::to_string(status) +
+          "). Re-run via the C++ entry point to recover refuse_reason.");
+    }
+    std::string ret(static_cast<const char*>(blob), size);
+    OCG_FreeSaveBuffer(blob);
+    return ret;
+  }
+
+  void YGO_LoadState(const std::string& blob) {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    if (pduel_ != nullptr) {
+      OCG_DestroyDuel(pduel_);
+      pduel_ = nullptr;
+    }
+    OCG_DuelOptions opts;
+    // Match the callbacks set in YGO_CreateDuel. Seeds, LP, etc. don't
+    // matter — load_state overwrites them from the blob.
+    for (int i = 0; i < 4; i++) opts.seed[i] = 0;
+    opts.flags = duel_options_;
+    opts.team1 = {8000, 5, 1};
+    opts.team2 = {8000, 5, 1};
+    opts.cardReader = &g_DataReader;
+    opts.payload1 = nullptr;
+    opts.scriptReader = &g_ScriptReader;
+    opts.payload2 = nullptr;
+    opts.logHandler = &g_LogHandler;
+    opts.payload3 = nullptr;
+    opts.cardReaderDone = [](void*, OCG_CardData*) {};
+    opts.payload4 = nullptr;
+    opts.enableUnsafeLibraries = 1;
+    OCG_Duel new_duel = nullptr;
+    int status = OCG_DuelLoadState(blob.data(),
+                                    static_cast<uint32_t>(blob.size()),
+                                    &opts, &new_duel);
+    if (status != OCG_LOAD_OK) {
+      throw std::runtime_error(
+          std::string("OCG_DuelLoadState failed (status=") +
+          std::to_string(status) + ")");
+    }
+    pduel_ = new_duel;
   }
 
   uint32_t YGO_GetMessage(OCG_Duel pduel, uint8_t* buf) {
