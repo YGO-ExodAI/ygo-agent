@@ -249,6 +249,55 @@ class PyEnvPool : public EnvPool {
     py::gil_scoped_release release;
     EnvPool::Reset(arr);
   }
+
+  // Phase P1 Primitive 1, Chunk 7: per-env save/load passthrough.
+  //
+  // PySaveState reaches into AsyncEnvPool::envs_[env_id] and forwards
+  // to the env's SaveState(). Returns the protobuf blob as py::bytes.
+  // PyLoadState forwards a blob to envs_[env_id]->LoadState().
+  //
+  // These bypass the Send/Recv message-passing path because save/load
+  // are infrequent control-plane operations, not per-step actions.
+  // The env's own SaveState/LoadState handle the core_mutex bracketing
+  // — no separate locking needed at this layer beyond GIL release.
+  //
+  // Caller responsibility: don't call save/load on an env_id that has
+  // a step in flight. Typical usage drains via Recv first.
+  py::bytes PySaveState(int env_id) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PySaveState: env_id out of range");
+    }
+    std::string blob;
+    {
+      py::gil_scoped_release release;
+      blob = this->envs_[env_id]->SaveState();
+    }
+    return py::bytes(blob);
+  }
+
+  void PyLoadState(int env_id, const py::bytes& blob) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PyLoadState: env_id out of range");
+    }
+    std::string blob_str = blob;  // implicit py::bytes -> std::string
+    py::gil_scoped_release release;
+    this->envs_[env_id]->LoadState(blob_str);
+  }
+
+  // Returns the konami codes of all cards present in the env's
+  // current duel state. Used by Chunk 7's script-corpus hash to
+  // know which c<id>.lua files contributed to the saved state.
+  std::vector<uint32_t> PyGetStateCardCodes(int env_id) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PyGetStateCardCodes: env_id out of range");
+    }
+    std::vector<uint32_t> codes;
+    {
+      py::gil_scoped_release release;
+      codes = this->envs_[env_id]->GetStateCardCodes();
+    }
+    return codes;
+  }
 };
 
 template <typename EnvPool>
@@ -282,6 +331,9 @@ py::object abc_meta = py::module::import("abc").attr("ABCMeta");
       .def("_recv", &ENVPOOL::PyRecv)                                \
       .def("_send", &ENVPOOL::PySend)                                \
       .def("_reset", &ENVPOOL::PyReset)                              \
+      .def("_save_state", &ENVPOOL::PySaveState)                     \
+      .def("_load_state", &ENVPOOL::PyLoadState)                     \
+      .def("_get_state_card_codes", &ENVPOOL::PyGetStateCardCodes)   \
       .def_readonly_static("_state_keys", &ENVPOOL::py_state_keys)   \
       .def_readonly_static("_action_keys",                           \
                            &ENVPOOL::py_action_keys);                \
