@@ -39,28 +39,40 @@ package("edopro-core")
     -- matching edo9300's own build (premake5: `compileas "C++"`).
 
     on_install("linux", function (package)
-        -- Chunk-1+ overlay (see header comment): mirror local ocgcore
-        -- working-copy files onto the fetched source so dev iteration
-        -- doesn't require a fork push for every change. Per chunks expand
-        -- this list as they touch new files; chunk-7's fork SHA bump
-        -- removes the entire block.
+        -- Chunk-5c (2026-04-22): switched from per-file overlay to
+        -- whole-tree mirror. Reason: xmake's git fetch was pulling
+        -- master-HEAD instead of the pinned b118d05 (the package's
+        -- shallow-clone codepath ignores the SHA). That made the
+        -- per-file overlay unstable — overlaid duel.h vs fetched
+        -- duel.cpp had drifted incompatibly between upstream master
+        -- HEAD and our exodai branch.
         --
-        -- TODO(chunk-7): delete this entire overlay block. The fork SHA bump
-        -- in chunk 7 makes all chunk-2..6 files part of the fetched source.
+        -- Whole-tree mirror sidesteps the version-resolution issue
+        -- entirely: the static lib is built from EXACTLY the local
+        -- ocgcore working tree. This is functionally equivalent to
+        -- what chunk-7's fork SHA bump achieves (eliminates the
+        -- fetched/overlaid divergence), just achieved via mirror
+        -- rather than fork-push.
+        --
+        -- TODO(chunk-7): delete this overlay block once the fork SHA
+        -- bump lands. The package_url + add_versions become the
+        -- single source of truth.
         local ocgcore_working = "/mnt/c/Users/Joe/Documents/edopro/edopro/ocgcore"
-        -- Chunk 2: serialize/ scaffolding
-        if os.isdir(path.join(ocgcore_working, "serialize")) then
-            os.cp(path.join(ocgcore_working, "serialize"), "serialize", {rootdir = ocgcore_working})
+        -- Wipe the fetched source dir, then mirror the whole local tree.
+        os.tryrm("*.cpp")
+        os.tryrm("*.h")
+        for _, dir in ipairs({"serialize", "RNG", "lua"}) do
+            os.tryrm(dir)
         end
-        -- Chunk 3: state-serialization C API + RNG state accessor.
-        -- Mirror the specific ocgcore files we've modified so the xmake
-        -- build sees the chunk-3 changes (OCG_SaveStatus / OCG_LoadStatus
-        -- enums, OCG_DuelSaveState declaration + implementation, and the
-        -- new Xoshiro256StarStar::get_state() accessor).
-        for _, rel in ipairs({"ocgapi.h", "ocgapi_types.h", "ocgapi.cpp", "duel.h", "RNG/Xoshiro256.hpp"}) do
-            local local_path = path.join(ocgcore_working, rel)
-            if os.isfile(local_path) then
-                os.cp(local_path, rel, {rootdir = ocgcore_working})
+        for _, ext in ipairs({"cpp", "h", "hpp"}) do
+            for _, f in ipairs(os.files(path.join(ocgcore_working, "*." .. ext))) do
+                os.cp(f, path.basename(f) .. "." .. ext)
+            end
+        end
+        for _, dir in ipairs({"serialize", "RNG", "lua"}) do
+            local src = path.join(ocgcore_working, dir)
+            if os.isdir(src) then
+                os.cp(src, dir, {rootdir = ocgcore_working})
             end
         end
 
