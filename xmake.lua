@@ -12,7 +12,7 @@ add_requires(
     -- ExodAI Phase P1 Primitive 1: state serialization runtime. Must stay in
     -- lockstep with the EDOPro client's vcpkg-supplied protobuf (both on the
     -- modern 4.x+/28.x lineage). See phase_p1_primitive_1_plan.md §1.4.
-    "protobuf-cpp 28.*")
+    "protobuf-cpp 28.x")
 
 
 target("ygopro0_ygoenv")
@@ -110,6 +110,16 @@ target("serialize_test_schema")
     -- .proto lives outside the project tree, so we sidestep the rule
     -- entirely. Pre-generation is invoked from a shell wrapper or by the
     -- developer running `cd $ocgcore_serialize && make proto` once.
+    --
+    -- Protoc convergence: this target's on_load -> `make proto` uses the
+    -- same xmake-managed `protobuf-cpp 28.x` package as the production
+    -- ygoenv build path (both via xrepo env / add_requires), so both
+    -- protoc invocations resolve to the identical xmake-installed
+    -- binary. No version-drift risk between test gencode and production
+    -- runtime as long as both pins stay aligned. (EDOPro/MSBuild uses
+    -- vcpkg's protoc — separate gencode tree, not shared with ygoenv,
+    -- so version drift between vcpkg and xmake is by design per
+    -- phase_p1_primitive_1_plan.md §1.3.)
     on_load(function (target)
         -- Idempotent pre-gen at target load. Hooks into xmake's build
         -- phase before add_files glob expansion.
@@ -127,6 +137,23 @@ target("serialize_test_handles")
     add_files(ocgcore_serialize .. "/tests/test_handles.cpp")
     add_includedirs(ocgcore_serialize)
     -- No protobuf dep — handle_table.h is pure header-only template.
+
+target("serialize_test_save")
+    set_kind("binary")
+    set_languages("c++17")
+    set_default(false)
+    -- Pre-gen .pb.cc same way serialize_test_schema does.
+    on_load(function (target)
+        os.execv("make", {"-C", "/mnt/c/Users/Joe/Documents/edopro/edopro/ocgcore/serialize", "proto"})
+    end)
+    add_files(ocgcore_serialize .. "/tests/test_save.cpp")
+    add_files(ocgcore_serialize .. "/ocg_state.pb.cc")
+    add_includedirs(ocgcore_serialize, ocgcore_serialize .. "/..")
+    -- Links the edopro-core static lib for OCG_CreateDuel /
+    -- OCG_DuelSaveState (defined in ocgapi.cpp + serialize/save_state.cpp,
+    -- both compiled into the package's static lib via the chunk-1+
+    -- overlay).
+    add_packages("edopro-core", "protobuf-cpp")
 
 target("alphazero_mcts")
     add_rules("python.library")
