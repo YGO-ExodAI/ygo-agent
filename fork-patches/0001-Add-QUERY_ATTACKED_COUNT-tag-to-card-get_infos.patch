@@ -1,0 +1,57 @@
+From b118d0585d208c0f65586f0ea7404daaee135da1 Mon Sep 17 00:00:00 2001
+From: Joe Darling <joedarling7@gmail.com>
+Date: Mon, 20 Apr 2026 05:32:02 -0700
+Subject: [PATCH] Add QUERY_ATTACKED_COUNT tag to card::get_infos
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Emits card->attacked_count as a uint8_t scalar TLV when the
+QUERY_ATTACKED_COUNT bit is set in a query flag. Needed by the
+ExodAI training environment (ygoenv's edopro wrapper) for
+observation feature col 42 — whether a face-up monster has
+attacked this turn — so the policy/value network can distinguish
+fresh attackers from ones that have already used their attack
+action. Previously the wrapper reached into card*->attacked_count
+via engine-pointer access under the Fluorohydride lineage; that
+pattern doesn't port to edo9300's opaque-handle API, and adding
+a QUERY_* tag is the clean way to expose the field.
+
+Tag value 0x4000000 (bit 26) chosen from the free range between
+QUERY_COVER (0x2000000) and QUERY_END (0x80000000).
+
+Consumer: src/ygo-agent/ygoenv/ygoenv/edopro/edopro.h in
+YGO-ExodAI/ExodAI, parse_one_card_tlv_() decoder case +
+get_cards_in_location() query flag set.
+---
+ card.cpp | 1 +
+ common.h | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/card.cpp b/card.cpp
+index f61744e..5e6cfce 100644
+--- a/card.cpp
++++ b/card.cpp
+@@ -185,6 +185,7 @@ void card::get_infos(uint32_t query_flag) {
+ 			insert_value<uint32_t>(pduel->query_buffer, cmit.first + ((cmit.second[0] + cmit.second[1]) << 16));
+ 	}
+ 	CHECK_AND_INSERT_T(QUERY_OWNER, owner, uint8_t);
++	CHECK_AND_INSERT_T(QUERY_ATTACKED_COUNT, attacked_count, uint8_t);
+ 	CHECK_AND_INSERT(QUERY_STATUS, status);
+ 	CHECK_AND_INSERT_T(QUERY_IS_PUBLIC, (is_position(POS_FACEUP) || is_related_to_chains() || (current.location == LOCATION_HAND && is_affected_by_effect(EFFECT_PUBLIC))) ? 1 : 0, uint8_t);
+ 	CHECK_AND_INSERT(QUERY_LSCALE, get_lscale());
+diff --git a/common.h b/common.h
+index 0f38291..34a3c65 100644
+--- a/common.h
++++ b/common.h
+@@ -233,6 +233,7 @@
+ #define QUERY_LINK         0x800000
+ #define QUERY_IS_HIDDEN	   0x1000000
+ #define QUERY_COVER        0x2000000
++#define QUERY_ATTACKED_COUNT 0x4000000
+ #define QUERY_END          0x80000000
+ 
+ //Link markers
+-- 
+2.34.1
+
