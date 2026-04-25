@@ -14,6 +14,7 @@ add_requires(
     -- modern 4.x+/28.x lineage). See phase_p1_primitive_1_plan.md §1.4.
     "protobuf-cpp 28.x")
 
+add_requireconfs("**.python", {version = "3.10.x", override = true})
 
 target("ygopro0_ygoenv")
     add_rules("python.library")
