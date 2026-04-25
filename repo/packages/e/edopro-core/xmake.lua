@@ -6,13 +6,15 @@ package("edopro-core")
     -- on one source of truth is the only way "same engine" is actually
     -- true.
     --
-    -- Pinned to b118d05 as of B.8 cutover (2026-04-21): fork@4d4bb4c +
-    -- QUERY_ATTACKED_COUNT patch (previously applied at build time via
-    -- io.replace; now upstreamed to the fork's exodai branch).
+    -- Pinned to 3626e69b (2026-04-25): chunk 9b schema v2 + field.core
+    -- scratch serialization (summonable_cards, attackable_cards, to_bp,
+    -- to_ep, select_chains). Prior pin b118d05 (B.8 cutover, 2026-04-21)
+    -- predated chunk 9b and emitted schema_version=1 blobs → MSG_RETRY.
     set_homepage("https://github.com/YGO-ExodAI/ygopro-core")
 
     set_urls("https://github.com/YGO-ExodAI/ygopro-core.git")
     add_versions("exodai-b118d05", "b118d0585d208c0f65586f0ea7404daaee135da1")
+    add_versions("exodai-3626e69b", "3626e69b52b64804062194a5df25c381e90491f6")
 
     -- ExodAI Phase P1 Primitive 1 (chunk 1): protobuf runtime for the
     -- serialize/ module. Listed as a package dep so xmake pulls it and the
