@@ -171,11 +171,27 @@ class Env {
     PostProcess();
   }
 
+  // Phase P1 Primitive 1, Chunk 7 (B2): publish current obs to the state
+  // buffer queue without taking a step. Used by save/load to refresh the
+  // observation buffers after _load_state restores pduel_ — without this
+  // the next Recv() returns stale obs from the pre-load game state.
+  // current_step_ is intentionally NOT advanced; this is a republish of
+  // the current decision point, not a new transition.
+  void EnvPublishObs(StateBufferQueue* sbq, int order) {
+    sbq_ = sbq;
+    order_ = order;
+    PublishObs();
+    slice_.done_write();
+  }
+
   virtual void Reset() { throw std::runtime_error("reset not implemented"); }
   virtual void Step(const Action& action) {
     throw std::runtime_error("step not implemented");
   }
   virtual bool IsDone() { throw std::runtime_error("is_done not implemented"); }
+  virtual void PublishObs() {
+    throw std::runtime_error("publish_obs not implemented");
+  }
 
  protected:
   void PreProcess(StateBufferQueue* sbq, int order, bool reset) {

@@ -284,6 +284,23 @@ class PyEnvPool : public EnvPool {
     this->envs_[env_id]->LoadState(blob_str);
   }
 
+  // Phase P1 Primitive 1, Chunk 7 (B2): republish the env's current obs
+  // into the state buffer queue without taking a step. Required between
+  // _load_state and the next _recv() — without it, the recv returns
+  // stale obs from the pre-load game state and rollout_from_state's
+  // obs_sync_fn falls back to the destructive reset() path.
+  //
+  // Caller responsibility (mirrors save/load): don't call on an env_id
+  // that has a step in flight. Order is -1 (async slot allocation), so
+  // single-env use cases don't need to coordinate ordering with peers.
+  void PyPublishObs(int env_id) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PyPublishObs: env_id out of range");
+    }
+    py::gil_scoped_release release;
+    this->envs_[env_id]->EnvPublishObs(this->state_buffer_queue_.get(), -1);
+  }
+
   // Returns the konami codes of all cards present in the env's
   // current duel state. Used by Chunk 7's script-corpus hash to
   // know which c<id>.lua files contributed to the saved state.
@@ -333,6 +350,7 @@ py::object abc_meta = py::module::import("abc").attr("ABCMeta");
       .def("_reset", &ENVPOOL::PyReset)                              \
       .def("_save_state", &ENVPOOL::PySaveState)                     \
       .def("_load_state", &ENVPOOL::PyLoadState)                     \
+      .def("_publish_obs", &ENVPOOL::PyPublishObs)                   \
       .def("_get_state_card_codes", &ENVPOOL::PyGetStateCardCodes)   \
       .def_readonly_static("_state_keys", &ENVPOOL::py_state_keys)   \
       .def_readonly_static("_action_keys",                           \

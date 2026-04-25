@@ -2222,6 +2222,14 @@ public:
     done_ = false;
   }
 
+  // Phase P1 Primitive 1, Chunk 7 (B2): republish the current obs.
+  // Required between LoadState and the next Recv(); without it, the
+  // env's state buffer still holds the pre-load observation. Wired
+  // through Env::EnvPublishObs which manages sbq/slice plumbing.
+  void PublishObs() override {
+    WriteState(0.0);
+  }
+
   void Reset() override {
     // clock_t start = clock();
     if (random_mode()) {
