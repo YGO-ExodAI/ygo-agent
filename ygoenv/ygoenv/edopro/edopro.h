@@ -2042,6 +2042,15 @@ protected:
   int dl_ = 0;
   int fdl_ = 0;
 
+  // Phase P1 Primitive 1, Chunk 9b followup (Issue 1, option B2): position
+  // in data_ where handle_message() most recently started reading. Updated
+  // at the top of handle_message before the u32 length-prefix consume.
+  // Lets GetPendingMessageBytes() return the exact frame that produced the
+  // current legal_actions_/msg_/to_play_, so the JSON sidecar can persist
+  // it across save/load. -1 sentinel means "no message has been parsed
+  // yet" (e.g., after a fresh Reset() before next() runs).
+  int last_msg_dp_start_ = -1;
+
   uint8_t query_buf_[16384];
   int qdp_ = 0;
 
@@ -2220,6 +2229,110 @@ public:
     // forward via the normal Send/Recv loop.
     duel_started_ = true;
     done_ = false;
+  }
+
+  // ---------------------------------------------------------------------
+  // Issue 1 / chunk-9b followup: in-flight message + field.returns
+  // sidecar accessors (option B2 in
+  // src/docs/issue1_chunk9b_loadstate_scoping.md).
+  //
+  // The chunk-9b proto fully captures engine state (field.core scratch,
+  // processor units, etc.) but NOT (a) the env adapter's parse buffer
+  // (data_/dp_/fdl_/legal_actions_/msg_/to_play_) and (b) the engine's
+  // ProgressiveBuffer field.returns. After LoadState the engine is at
+  // the right step==1 boundary, but the adapter's caches still reflect
+  // the pre-load (diverged) decision and field.returns is default-
+  // constructed (zero), so:
+  //   * WriteState() surfaces the diverged-state n_options/to_play
+  //   * a missed callback before Process would dispatch summonable[0]
+  //
+  // Fix architecture: persist these out-of-band in the JSON sidecar.
+  // No proto schema bump, no ocgcore ABI change.
+  //
+  //   GetPendingMessageBytes() — return the wire-format frame for the
+  //     most-recent handle_message() call (the one that built the
+  //     current legal_actions_). Empty vector if no message has been
+  //     parsed yet.
+  //   GetFieldReturns() — return a copy of pduel->game_field->returns.data
+  //     (the in-flight ProgressiveBuffer used by every Tier-3 select
+  //     handler's step==1 dispatch). Empty if engine is not initialized.
+  //   SetPendingMessageState(bytes, returns) — atomically: restore the
+  //     message frame into data_, restore field.returns, clear the
+  //     adapter caches, and re-run handle_message() to repopulate
+  //     legal_actions_/msg_/to_play_/callback_ from the same wire bytes
+  //     the policy saw at save time.
+  // ---------------------------------------------------------------------
+  std::vector<uint8_t> GetPendingMessageBytes() {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    std::vector<uint8_t> out;
+    if (last_msg_dp_start_ < 0 || dl_ <= last_msg_dp_start_ ||
+        dl_ > static_cast<int>(sizeof(data_))) {
+      return out;
+    }
+    out.assign(data_ + last_msg_dp_start_, data_ + dl_);
+    return out;
+  }
+
+  std::vector<uint8_t> GetFieldReturns() {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    std::vector<uint8_t> out;
+    if (pduel_ == nullptr) return out;
+    auto* d = static_cast<duel*>(pduel_);
+    if (d->game_field == nullptr) return out;
+    out = d->game_field->returns.data;
+    return out;
+  }
+
+  void SetPendingMessageState(const std::vector<uint8_t>& msg_bytes,
+                              const std::vector<uint8_t>& field_returns) {
+    std::lock_guard<std::mutex> lock(core_mutex());
+    if (pduel_ == nullptr) {
+      throw std::runtime_error(
+          "SetPendingMessageState: pduel is null (call after LoadState)");
+    }
+    if (msg_bytes.empty()) {
+      throw std::runtime_error(
+          "SetPendingMessageState: msg_bytes is empty; sidecar missing "
+          "pending_message_bytes — caller should skip the restore call "
+          "for v2 blobs without sidecar fields");
+    }
+    if (msg_bytes.size() > sizeof(data_)) {
+      throw std::runtime_error(
+          "SetPendingMessageState: msg_bytes (" +
+          std::to_string(msg_bytes.size()) +
+          ") exceeds adapter data_ buffer (" +
+          std::to_string(sizeof(data_)) + ")");
+    }
+
+    // Restore field.returns first so the engine's in-flight response
+    // slot matches save time before any subsequent Process call. Each
+    // Tier-3 step==0 already (re-)writes -1 sentinel for selectables
+    // that need it; this just keeps continuity for non-overwriting
+    // variants and protects against a missed SetResponse path.
+    auto* d = static_cast<duel*>(pduel_);
+    if (d->game_field != nullptr) {
+      d->game_field->returns.data = field_returns;
+    }
+
+    // Reset adapter-side caches that handle_message() will re-populate.
+    legal_actions_.clear();
+    msg_ = 0;
+    to_play_ = 0;
+    callback_ = nullptr;
+    qdp_ = 0;
+
+    // Stage the saved message frame into the parse buffer and re-emit
+    // through handle_message(). This re-derives legal_actions_/msg_/
+    // to_play_/callback_ from the exact wire bytes that produced them
+    // pre-save — so post-load WriteState() sees the saved decision,
+    // not the diverged one.
+    std::memcpy(data_, msg_bytes.data(), msg_bytes.size());
+    fdl_ = static_cast<int>(msg_bytes.size());
+    dp_ = 0;
+    dl_ = 0;
+    last_msg_dp_start_ = -1;
+
+    handle_message();
   }
 
   // Phase P1 Primitive 1, Chunk 7 (B2): republish the current obs.
@@ -4669,6 +4782,11 @@ private:
   }
 
   void handle_message() {
+    // Issue 1 / chunk-9b sidecar: snapshot the start of this message frame
+    // before consuming the length prefix. GetPendingMessageBytes() reads
+    // data_[last_msg_dp_start_..dl_] to capture the exact wire-format
+    // bytes that produced the current decision.
+    last_msg_dp_start_ = dp_;
     int l_ = read_u32();
     dl_ = dp_ + l_;
     msg_ = int(data_[dp_++]);

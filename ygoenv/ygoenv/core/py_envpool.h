@@ -315,6 +315,57 @@ class PyEnvPool : public EnvPool {
     }
     return codes;
   }
+
+  // Phase P1 Primitive 1, Chunk 9b followup (Issue 1, option B2):
+  // expose env-adapter pending-message state for the JSON sidecar.
+  //
+  // PyGetPendingMessageBytes — wire-format bytes of the most-recent
+  //   handle_message() frame (the one that built the current
+  //   legal_actions_). Returned as py::bytes so the Python sidecar
+  //   layer can b64-encode and persist it. Empty if no message has
+  //   been parsed yet.
+  // PyGetFieldReturns — engine field.returns ProgressiveBuffer.data
+  //   snapshot. Returned as py::bytes for symmetry. Not in the proto.
+  // PySetPendingMessageState — atomic restore of both fields after
+  //   LoadState. Re-runs handle_message() internally to repopulate
+  //   legal_actions_/msg_/to_play_/callback_ from the saved bytes.
+  py::bytes PyGetPendingMessageBytes(int env_id) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PyGetPendingMessageBytes: env_id out of range");
+    }
+    std::vector<uint8_t> bytes;
+    {
+      py::gil_scoped_release release;
+      bytes = this->envs_[env_id]->GetPendingMessageBytes();
+    }
+    return py::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  }
+
+  py::bytes PyGetFieldReturns(int env_id) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PyGetFieldReturns: env_id out of range");
+    }
+    std::vector<uint8_t> bytes;
+    {
+      py::gil_scoped_release release;
+      bytes = this->envs_[env_id]->GetFieldReturns();
+    }
+    return py::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  }
+
+  void PySetPendingMessageState(int env_id,
+                                const py::bytes& msg_bytes,
+                                const py::bytes& field_returns) {
+    if (env_id < 0 || static_cast<std::size_t>(env_id) >= this->envs_.size()) {
+      throw std::runtime_error("PySetPendingMessageState: env_id out of range");
+    }
+    std::string msg_str = msg_bytes;
+    std::string returns_str = field_returns;
+    std::vector<uint8_t> msg_vec(msg_str.begin(), msg_str.end());
+    std::vector<uint8_t> ret_vec(returns_str.begin(), returns_str.end());
+    py::gil_scoped_release release;
+    this->envs_[env_id]->SetPendingMessageState(msg_vec, ret_vec);
+  }
 };
 
 template <typename EnvPool>
@@ -352,6 +403,11 @@ py::object abc_meta = py::module::import("abc").attr("ABCMeta");
       .def("_load_state", &ENVPOOL::PyLoadState)                     \
       .def("_publish_obs", &ENVPOOL::PyPublishObs)                   \
       .def("_get_state_card_codes", &ENVPOOL::PyGetStateCardCodes)   \
+      .def("_get_pending_message_bytes",                             \
+           &ENVPOOL::PyGetPendingMessageBytes)                       \
+      .def("_get_field_returns", &ENVPOOL::PyGetFieldReturns)        \
+      .def("_set_pending_message_state",                             \
+           &ENVPOOL::PySetPendingMessageState)                       \
       .def_readonly_static("_state_keys", &ENVPOOL::py_state_keys)   \
       .def_readonly_static("_action_keys",                           \
                            &ENVPOOL::py_action_keys);                \
