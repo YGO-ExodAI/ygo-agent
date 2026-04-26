@@ -6,7 +6,7 @@ add_repositories("my-repo repo")
 -- spike. The prior disable commit (bab5959) noted a "template with C
 -- linkage" error from /usr/include/c++/11/bits/allocated_ptr.h.
 add_requires(
-    "ygopro-core 0.0.2", "edopro-core exodai-3626e69b", "pybind11 2.13.*", "fmt 10.2.*", "glog 0.6.0",
+    "ygopro-core 0.0.2", "edopro-core exodai-c69921f", "pybind11 2.13.*", "fmt 10.2.*", "glog 0.6.0",
     "sqlite3 3.43.0+200", "concurrentqueue 1.0.4", "unordered_dense 4.4.*",
     "sqlitecpp 3.2.1", "lua",
     -- ExodAI Phase P1 Primitive 1: state serialization runtime. Must stay in
