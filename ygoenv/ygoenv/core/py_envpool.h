@@ -299,6 +299,15 @@ class PyEnvPool : public EnvPool {
     }
     py::gil_scoped_release release;
     this->envs_[env_id]->EnvPublishObs(this->state_buffer_queue_.get(), -1);
+    // Keep stepping_env_num_ in sync with the slot we just published.
+    // Without this, the next Recv() takes the partial-batch drain branch
+    // (additional_wait > 0), which overshoots StateBuffer::done_count_
+    // and bumps alloc_count_ ahead — desynchronizing the alloc/done
+    // pointers so the *next* envs.step() reads from an empty queue slot
+    // and returns Truncate(0). See src/docs/p5/index-error-characterization.md.
+    if (this->is_sync_) {
+      this->stepping_env_num_++;
+    }
   }
 
   // Returns the konami codes of all cards present in the env's
