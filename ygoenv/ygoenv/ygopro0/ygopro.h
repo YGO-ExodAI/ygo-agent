@@ -1019,12 +1019,12 @@ inline const Card &c_get_card(CardCode code) {
   throw std::runtime_error("[c_get_card] Card not found: " + std::to_string(code));
 }
 
-inline CardId &c_get_card_id(CardCode code) {
+inline CardId c_get_card_id(CardCode code) {
   auto it = card_ids_.find(code);
   if (it != card_ids_.end()) {
     return it->second;
   }
-  throw std::runtime_error("[c_get_card_id] Card not found: " + std::to_string(code));
+  return static_cast<CardId>(0);
 }
 
 inline void sort_extra_deck(std::vector<CardCode> &deck) {
@@ -4787,6 +4787,29 @@ private:
     }
 
     duel_started_ = false;
+  }
+
+public:
+  // Stubs required by py_envpool.h (Phase P2 eval infra, edopro-only).
+  // The ygopro0 backend is soft-frozen; these are never called at runtime.
+  std::string SaveState() {
+    throw std::runtime_error("not implemented for ygopro0 backend");
+  }
+  void LoadState(const std::string&) {
+    throw std::runtime_error("not implemented for ygopro0 backend");
+  }
+  std::vector<uint32_t> GetStateCardCodes() {
+    throw std::runtime_error("not implemented for ygopro0 backend");
+  }
+  std::vector<uint8_t> GetPendingMessageBytes() {
+    throw std::runtime_error("not implemented for ygopro0 backend");
+  }
+  std::vector<uint8_t> GetFieldReturns() {
+    throw std::runtime_error("not implemented for ygopro0 backend");
+  }
+  void SetPendingMessageState(const std::vector<uint8_t>&,
+                              const std::vector<uint8_t>&) {
+    throw std::runtime_error("not implemented for ygopro0 backend");
   }
 };
 
